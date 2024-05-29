@@ -9,6 +9,7 @@ use std::{
 
 use axum::body::Body;
 use hyper::{Request, Response, StatusCode};
+use std::fmt;
 use tokio::sync::Semaphore;
 use tower::{Layer, Service};
 
@@ -94,85 +95,68 @@ impl PathfinderPaths {
         println!("Average latency for path {}: {}", path, average_latency);
         average_latency
     }
-
-    fn get_average_latency_of_specified_paths(&self, paths: &[&str]) -> f64 {
-        let mut sum = 0.0;
-        let mut count = 0;
-        for path in paths {
-            if let Some(latencies) = self.paths.get(*path) {
-                sum += latencies.iter().sum::<f64>();
-                count += latencies.len();
-            }
-        }
-        let average_latency = if count == 0 { 0.0 } else { sum / count as f64 };
-
-        println!(
-            "Average latency of specified paths {:?}: {}",
-            paths, average_latency
-        );
-        average_latency
-    }
 }
-
 #[derive(Debug, Clone)]
 struct PathfinderCurrentlyRequestedPaths {
-    currently_requested_paths: Arc<Mutex<HashSet<String>>>,
+    currently_requested_paths: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl PathfinderCurrentlyRequestedPaths {
     fn new() -> Self {
         Self {
-            currently_requested_paths: Arc::new(Mutex::new(HashSet::new())),
+            currently_requested_paths: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn add_path(&self, path: &str) {
         println!("Adding path to currently requested paths: {}", path);
-        self.currently_requested_paths
-            .lock()
-            .unwrap()
-            .insert(path.to_string());
-        println!(
-            "Currently requested paths: {:?}",
-            self.currently_requested_paths
-        );
+        let mut paths = self.currently_requested_paths.lock().unwrap();
+        let count = paths.entry(path.to_string()).or_insert(0);
+        *count += 1;
     }
 
     fn remove_path(&self, path: &str) {
         println!("Removing path from currently requested paths: {}", path);
-        self.currently_requested_paths.lock().unwrap().remove(path);
-        println!(
-            "Currently requested paths: {:?}",
-            self.currently_requested_paths
-        );
+        let mut paths = self.currently_requested_paths.lock().unwrap();
+        if let Some(count) = paths.get_mut(path) {
+            *count -= 1;
+            if *count == 0 {
+                paths.remove(path);
+            }
+        }
     }
 
-    fn get_currently_requested_paths(&self) -> Vec<String> {
+    fn get_currently_requested_paths(&self) -> Vec<(String, u32)> {
         let paths = self
             .currently_requested_paths
             .lock()
             .unwrap()
             .iter()
-            .cloned()
+            .map(|(path, &count)| (path.clone(), count))
             .collect();
-        println!("Getting currently requested paths: {:?}", paths);
+        println!("Currently requested paths: {:?}", self);
         paths
     }
 
-    fn get_average_latency_of_currently_requested_paths(&self, paths: &PathfinderPaths) -> f64 {
+    fn get_total_latency_of_currently_requested_paths(&self, paths: &PathfinderPaths) -> f64 {
         let currently_requested_paths = self.get_currently_requested_paths();
-        let average_latency = paths.get_average_latency_of_specified_paths(
-            &currently_requested_paths
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<&str>>(),
-        );
+        let mut total_latency = 0.0;
+        let mut total_count = 0;
+
+        for (path, count) in currently_requested_paths {
+            let avg_latency = paths.get_path_average_latency(&path);
+            total_latency += avg_latency * count as f64;
+            total_count += count;
+        }
+
+        // Corrected system total latency calculation
+        let system_total_latency = total_latency;
 
         println!(
-            "Average latency of currently requested paths {:?}: {}",
-            currently_requested_paths, average_latency
+            "Total latency of currently requested paths: {}",
+            system_total_latency
         );
-        average_latency
+        system_total_latency
     }
 }
 
@@ -248,57 +232,45 @@ where
             let permit = semaphore.acquire().await.unwrap();
 
             // Add the path to currently requested paths
-            currently_requested_paths
-                .lock()
-                .unwrap()
-                .add_path(&normalized_path);
+            {
+                let currently_requested_paths = currently_requested_paths.lock().unwrap();
+                currently_requested_paths.add_path(&normalized_path);
+            }
 
-            let res = fut.await?;
+            // Calculate the system average latency without including the current request
+            let system_average_latency;
+            {
+                let paths = paths.lock().unwrap();
+                let currently_requested_paths = currently_requested_paths.lock().unwrap();
+                system_average_latency = currently_requested_paths
+                    .get_total_latency_of_currently_requested_paths(&*paths);
+            }
 
-            let latency = start.elapsed().as_secs_f64() * 1000.0;
-
-            println!("Request for path {} took {} ms", normalized_path, latency);
-
-            // Update path latency
-            paths.lock().unwrap().update_path_latency(
-                &normalized_path,
-                // cap latency at half of max to avoid lockouts on overload where it is already over the max, so it always 503's. This allows for recovery.
-                if latency > max_allowable_system_average_latency_ms / 2.0 {
-                    max_allowable_system_average_latency_ms / 2.0
-                } else {
-                    latency
-                },
-            );
-
-            // Get the average latency of currently requested paths
-            let system_average_latency = currently_requested_paths
-                .lock()
-                .unwrap()
-                .get_average_latency_of_currently_requested_paths(&*paths.lock().unwrap());
-
-            // Get the average latency for this path
-            let current_path_average_latency = paths
-                .lock()
-                .unwrap()
-                .get_path_average_latency(&normalized_path);
+            let current_path_average_latency;
+            {
+                let paths = paths.lock().unwrap();
+                current_path_average_latency = paths.get_path_average_latency(&normalized_path);
+            }
 
             println!(
-                "System average latency: {} ms, Current path average latency: {} ms",
-                system_average_latency, current_path_average_latency
+                "System average latency: {}, Current path average latency: {}, Max allowable system average latency: {}",
+                system_average_latency, current_path_average_latency, max_allowable_system_average_latency_ms
             );
 
-            if (system_average_latency + current_path_average_latency)
+            // Check if the system is under high load without including the current request
+            if system_average_latency + current_path_average_latency
                 > max_allowable_system_average_latency_ms
             {
                 println!(
                     "System under high load. Shedding request for path: {}",
                     normalized_path
                 );
+
                 // Remove the path from currently requested paths
-                currently_requested_paths
-                    .lock()
-                    .unwrap()
-                    .remove_path(&normalized_path);
+                {
+                    let currently_requested_paths = currently_requested_paths.lock().unwrap();
+                    currently_requested_paths.remove_path(&normalized_path);
+                }
 
                 // Release the permit back to the semaphore
                 drop(permit);
@@ -310,11 +282,28 @@ where
                     .unwrap());
             }
 
+            let res = fut.await?;
+
+            let latency = start.elapsed().as_secs_f64() * 1000.0;
+            println!("Request for path {} took {} ms", normalized_path, latency);
+
+            {
+                let mut paths = paths.lock().unwrap();
+                paths.update_path_latency(
+                    &normalized_path,
+                    if latency > max_allowable_system_average_latency_ms / 3.0 {
+                        max_allowable_system_average_latency_ms / 3.0
+                    } else {
+                        latency
+                    },
+                );
+            }
+
             // Remove the path from currently requested paths
-            currently_requested_paths
-                .lock()
-                .unwrap()
-                .remove_path(&normalized_path);
+            {
+                let currently_requested_paths = currently_requested_paths.lock().unwrap();
+                currently_requested_paths.remove_path(&normalized_path);
+            }
 
             // Release the permit back to the semaphore
             drop(permit);
