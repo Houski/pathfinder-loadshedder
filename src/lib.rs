@@ -9,7 +9,9 @@ use std::{
 
 use axum::body::Body;
 use hyper::{Request, Response, StatusCode};
+use std::time::Duration;
 use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use tower::{Layer, Service};
 
 #[derive(Clone, Debug)]
@@ -167,6 +169,7 @@ pub struct PathfinderLoadShedder<S> {
     pathfinder_path_transforms: PathfinderPathTransforms,
     inner: S,
     semaphore: Arc<Semaphore>,
+    timeout_duration_ms: f64,
 }
 
 impl<S> PathfinderLoadShedder<S> {
@@ -175,6 +178,7 @@ impl<S> PathfinderLoadShedder<S> {
         pathfinder_path_transforms: PathfinderPathTransforms,
         inner: S,
         max_concurrent_requests: usize,
+        timeout_duration_ms: f64,
     ) -> Self {
         Self {
             max_allowable_system_average_latency_ms,
@@ -187,6 +191,7 @@ impl<S> PathfinderLoadShedder<S> {
             pathfinder_path_transforms,
             inner,
             semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
+            timeout_duration_ms,
         }
     }
 }
@@ -213,6 +218,7 @@ where
         let paths = self.paths.clone();
         let currently_requested_paths = self.currently_requested_paths.clone();
         let semaphore = self.semaphore.clone();
+        let timeout_duration: Duration = Duration::from_millis(self.timeout_duration_ms as u64);
 
         let normalized_path = match self.pathfinder_path_transforms.normalize_path(&path) {
             Some(p) => p,
@@ -265,7 +271,11 @@ where
                 // Return 503 response
                 return Ok(Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .body(Body::empty())
+                    .header(
+                        "Retry-After",
+                        (max_allowable_system_average_latency_ms / 1000.0).ceil() as u32,
+                    )
+                    .body("Server is under high load, plrease try again".into())
                     .unwrap());
             }
 
@@ -275,12 +285,13 @@ where
                 currently_requested_paths.add_path(&normalized_path);
             }
 
-            let res = fut.await?;
+            let res = timeout(timeout_duration, fut).await;
 
             let latency = start.elapsed().as_secs_f64() * 1000.0;
             println!("Request for path {} took {} ms", normalized_path, latency);
 
             // max out the latency at half the max capacity to avoid situations where the latency is too high causing it to lock up and never recover
+            // This avoids lock ups where no requests can be made as the average latency to load the page is already over the max allowed.
             let latency = match latency >= max_allowable_system_average_latency_ms - 1.0 {
                 true => {
                     let capped_latency = max_allowable_system_average_latency_ms - 1.0;
@@ -296,10 +307,6 @@ where
             {
                 let mut paths = paths.write().unwrap();
                 paths.update_path_latency(&normalized_path, latency);
-            }
-
-            // Remove the path from currently requested paths
-            {
                 let currently_requested_paths = currently_requested_paths.read().unwrap();
                 currently_requested_paths.remove_path(&normalized_path);
             }
@@ -307,7 +314,20 @@ where
             // Release the permit back to the semaphore
             drop(permit);
 
-            Ok(res)
+            match res {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(err)) => Err(err),
+                Err(_) => {
+                    println!(
+                        "Request for path {} timed out after {:?}",
+                        path, timeout_duration
+                    );
+                    Ok(Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body("Request timed out".into())
+                        .unwrap())
+                }
+            }
         })
     }
 }
@@ -317,6 +337,7 @@ pub struct PathfinderLoadShedderLayer {
     max_allowable_system_average_latency_ms: f64,
     pathfinder_path_transforms: PathfinderPathTransforms,
     max_concurrent_requests: usize,
+    timeout_duration_ms: f64,
 }
 
 impl PathfinderLoadShedderLayer {
@@ -324,11 +345,13 @@ impl PathfinderLoadShedderLayer {
         max_allowable_system_average_latency_ms: f64,
         pathfinder_path_transforms: Vec<&'static str>,
         max_concurrent_requests: usize,
+        timeout_duration_ms: f64,
     ) -> Self {
         Self {
             max_allowable_system_average_latency_ms,
             pathfinder_path_transforms: PathfinderPathTransforms::new(pathfinder_path_transforms),
             max_concurrent_requests,
+            timeout_duration_ms,
         }
     }
 }
@@ -342,6 +365,7 @@ impl<S> Layer<S> for PathfinderLoadShedderLayer {
             self.pathfinder_path_transforms.clone(),
             inner,
             self.max_concurrent_requests,
+            self.timeout_duration_ms,
         )
     }
 }
@@ -467,7 +491,7 @@ mod tests {
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer = PathfinderLoadShedderLayer::new(500.0, vec!["/test/*"], 10);
+        let layer = PathfinderLoadShedderLayer::new(500.0, vec!["/test/*"], 10, 1000.0);
         let mut load_shedder = layer.layer(service);
 
         let request = Request::builder()
@@ -485,7 +509,7 @@ mod tests {
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer = PathfinderLoadShedderLayer::new(500.0, vec!["/test/*"], 1);
+        let layer = PathfinderLoadShedderLayer::new(500.0, vec!["/test/*"], 1, 1000.0);
         let mut load_shedder = layer.layer(service);
 
         let request = Request::builder()
@@ -517,7 +541,7 @@ mod tests {
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer = PathfinderLoadShedderLayer::new(240.0, vec!["/test/*"], 2);
+        let layer = PathfinderLoadShedderLayer::new(240.0, vec!["/test/*"], 2, 1000.0);
         let mut load_shedder = layer.layer(service);
 
         let request1 = Request::builder()
@@ -585,14 +609,15 @@ mod tests {
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer = PathfinderLoadShedderLayer::new(240.0, vec!["/test/*"], 2);
+        let layer = PathfinderLoadShedderLayer::new(240.0, vec!["/test/*"], 2, 1000.0);
 
         let request = Request::builder()
             .uri("/test/path")
             .body(Body::empty())
             .unwrap();
 
-        // latency registered should be half of 240, so 120 max.
+        // latency registered should 240 ms - 1 ms, because the longest a request's latency can be is the max time allowed minus 1 ms.
+        // This avoids lock ups where no requests can be made as the average latency to load the page is already over the max allowed.
 
         let mut load_shedder = layer.layer(service);
 
@@ -613,7 +638,7 @@ mod tests {
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer = PathfinderLoadShedderLayer::new(500.0, vec!["/test/*"], 1);
+        let layer = PathfinderLoadShedderLayer::new(500.0, vec!["/test/*"], 1, 1000.0);
         let mut load_shedder = layer.layer(service);
 
         let request = Request::builder()
@@ -635,7 +660,7 @@ mod tests {
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer = PathfinderLoadShedderLayer::new(500.0, vec!["/test/*"], 1);
+        let layer = PathfinderLoadShedderLayer::new(500.0, vec!["/test/*"], 1, 1000.0);
         let mut load_shedder = layer.layer(service);
 
         let request = Request::builder()
@@ -659,5 +684,24 @@ mod tests {
                 .get_currently_requested_paths()
                 .is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn test_timeout() {
+        let service = service_fn(|_req: Request<Body>| async {
+            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+            Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
+        });
+
+        let layer = PathfinderLoadShedderLayer::new(500.0, vec!["/test/*"], 10, 1000.0);
+        let mut load_shedder = layer.layer(service);
+
+        let request = Request::builder()
+            .uri("/test/path")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = load_shedder.call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
