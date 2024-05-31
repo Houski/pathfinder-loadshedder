@@ -235,6 +235,13 @@ where
             let permit = match semaphore.try_acquire() {
                 Ok(permit) => permit,
                 Err(_) => {
+                    {
+                        currently_requested_paths
+                            .write()
+                            .unwrap()
+                            .remove_path(&normalized_path);
+                    }
+                    // Return 503 response
                     return Ok(Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
                         .body("Server is under high load, please try again".into())
@@ -253,6 +260,14 @@ where
 
             // Check if the system is under high load including the current request
             if system_average_latency > max_allowable_system_average_latency_ms {
+                // Remove the path from currently requested paths as we are not going to process it
+                {
+                    currently_requested_paths
+                        .write()
+                        .unwrap()
+                        .remove_path(&normalized_path);
+                }
+
                 // Release the permit back to the semaphore
                 drop(permit);
 
