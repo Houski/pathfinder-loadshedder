@@ -213,12 +213,12 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let path = req.uri().path().to_string();
         let start = Instant::now();
-        let max_allowable_system_average_latency_ms = self.max_allowable_system_average_latency_ms;
         let fut = self.inner.call(req);
         let paths = self.paths.clone();
         let currently_requested_paths = self.currently_requested_paths.clone();
         let semaphore = self.semaphore.clone();
         let timeout_duration: Duration = Duration::from_millis(self.timeout_duration_ms as u64);
+        let max_allowable_system_average_latency_ms = self.max_allowable_system_average_latency_ms;
 
         let normalized_path = match self.pathfinder_path_transforms.normalize_path(&path) {
             Some(p) => p,
@@ -231,10 +231,16 @@ where
         };
 
         Box::pin(async move {
-            println!("Handling request for path: {}", normalized_path);
-
             // Acquire a permit from the semaphore
-            let permit = semaphore.acquire().await.unwrap();
+            let permit = match semaphore.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body("Server is under high load, please try again".into())
+                        .unwrap());
+                }
+            };
 
             // Calculate the system average latency including the current request
             let system_average_latency;
@@ -245,26 +251,8 @@ where
                     .get_total_latency_of_currently_requested_paths(&*paths);
             }
 
-            let current_path_average_latency;
-            {
-                let paths = paths.read().unwrap();
-                current_path_average_latency = paths.get_path_average_latency(&normalized_path);
-            }
-
-            println!(
-                "System average latency: {}, Current path average latency: {}, Max allowable system average latency: {}",
-                system_average_latency, current_path_average_latency, max_allowable_system_average_latency_ms
-            );
-
             // Check if the system is under high load including the current request
-            if system_average_latency + current_path_average_latency
-                > max_allowable_system_average_latency_ms
-            {
-                println!(
-                    "System under high load. Shedding request for path: {}",
-                    normalized_path
-                );
-
+            if system_average_latency > max_allowable_system_average_latency_ms {
                 // Release the permit back to the semaphore
                 drop(permit);
 
@@ -275,40 +263,35 @@ where
                         "Retry-After",
                         (max_allowable_system_average_latency_ms / 1000.0).ceil() as u32,
                     )
-                    .body("Server is under high load, plrease try again".into())
+                    .body("Server is under high load, please try again".into())
                     .unwrap());
             }
 
             // Add the path to currently requested paths
-            {
-                let currently_requested_paths = currently_requested_paths.read().unwrap();
-                currently_requested_paths.add_path(&normalized_path);
-            }
+            currently_requested_paths
+                .write()
+                .unwrap()
+                .add_path(&normalized_path);
 
             let res = timeout(timeout_duration, fut).await;
 
             let latency = start.elapsed().as_secs_f64() * 1000.0;
-            println!("Request for path {} took {} ms", normalized_path, latency);
 
-            // max out the latency at half the max capacity to avoid situations where the latency is too high causing it to lock up and never recover
-            // This avoids lock ups where no requests can be made as the average latency to load the page is already over the max allowed.
-            let latency = match latency >= max_allowable_system_average_latency_ms - 1.0 {
-                true => {
-                    let capped_latency = max_allowable_system_average_latency_ms - 1.0;
-                    println!(
-                        "Request latency is higher than max allowable system average latency. Capping latency at {} ms to avoid lockup",
-                        capped_latency
-                    );
-                    capped_latency
-                }
-                false => latency,
+            let capped_latency = if latency >= max_allowable_system_average_latency_ms - 1.0 {
+                max_allowable_system_average_latency_ms - 1.0
+            } else {
+                latency
             };
 
             {
-                let mut paths = paths.write().unwrap();
-                paths.update_path_latency(&normalized_path, latency);
-                let currently_requested_paths = currently_requested_paths.read().unwrap();
-                currently_requested_paths.remove_path(&normalized_path);
+                paths
+                    .write()
+                    .unwrap()
+                    .update_path_latency(&normalized_path, capped_latency);
+                currently_requested_paths
+                    .write()
+                    .unwrap()
+                    .remove_path(&normalized_path);
             }
 
             // Release the permit back to the semaphore
@@ -317,16 +300,10 @@ where
             match res {
                 Ok(Ok(response)) => Ok(response),
                 Ok(Err(err)) => Err(err),
-                Err(_) => {
-                    println!(
-                        "Request for path {} timed out after {:?}",
-                        path, timeout_duration
-                    );
-                    Ok(Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .body("Request timed out".into())
-                        .unwrap())
-                }
+                Err(_) => Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body("Request timed out".into())
+                    .unwrap()),
             }
         })
     }
@@ -504,44 +481,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_shedding_overload() {
-        let service = service_fn(|_req: Request<Body>| async {
-            Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
-        });
-
-        let layer = PathfinderLoadShedderLayer::new(500.0, vec!["/test/*"], 1, 1000.0);
-        let mut load_shedder = layer.layer(service);
-
-        let request = Request::builder()
-            .uri("/test/path")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = load_shedder.call(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        {
-            let mut paths = load_shedder.paths.write().unwrap();
-            paths.update_path_latency("/test/*", 1000.0);
-        }
-
-        let request = Request::builder()
-            .uri("/test/path")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = load_shedder.call(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[tokio::test]
     async fn test_load_shedding_concurrency_handling() {
         let service = service_fn(|_req: Request<Body>| async {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer = PathfinderLoadShedderLayer::new(240.0, vec!["/test/*"], 2, 1000.0);
+        let layer = PathfinderLoadShedderLayer::new(240.0, vec!["/test/*"], 2, 10000.0);
         let mut load_shedder = layer.layer(service);
 
         let request1 = Request::builder()
@@ -703,5 +649,121 @@ mod tests {
 
         let response = load_shedder.call(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_burst() {
+        let service = service_fn(|_req: Request<Body>| async {
+            // Simulate some processing time
+            tokio::time::sleep(tokio::time::Duration::from_millis(4000)).await;
+            Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
+        });
+
+        let layer = PathfinderLoadShedderLayer::new(10000.0, vec!["/test/*"], 10, 20000.0);
+        let load_shedder = layer.layer(service);
+
+        let mut handles = vec![];
+
+        for i in 0..30 {
+            let request = Request::builder()
+                .uri("/test/path")
+                .body(Body::empty())
+                .unwrap();
+
+            let mut shedder_clone = load_shedder.clone();
+
+            let handle = tokio::spawn(async move {
+                let response = shedder_clone.call(request).await;
+                println!("Request {}: {:?}", i, response);
+                response
+            });
+
+            handles.push(handle);
+        }
+
+        // Await all the handles
+        let results = futures::future::join_all(handles).await;
+
+        // Filter down to unique results, there should be two, 200 and 503
+        let mut response_types: Vec<_> = results
+            .into_iter()
+            .map(|result| match result {
+                Ok(Ok(response)) => {
+                    if response.status() == StatusCode::OK {
+                        "OK"
+                    } else {
+                        "ERROR"
+                    }
+                }
+                Ok(Err(_)) => "ERROR",
+                Err(_) => "ERROR",
+            })
+            .collect();
+
+        println!("Response types: {:?}", response_types);
+
+        // Sort and deduplicate the vector
+        response_types.sort();
+        response_types.dedup();
+
+        assert!(
+            response_types.contains(&"OK") && response_types.contains(&"ERROR"),
+            "Expected both OK and ERROR responses, got: {:?}",
+            response_types
+        );
+
+        // run the whole thing again to make sure its functional again after
+
+        println!("Running the test again to make sure it works after the burst");
+
+        let mut handles = vec![];
+
+        for i in 0..30 {
+            let request = Request::builder()
+                .uri("/test/path")
+                .body(Body::empty())
+                .unwrap();
+
+            let mut shedder_clone = load_shedder.clone();
+
+            let handle = tokio::spawn(async move {
+                let response = shedder_clone.call(request).await;
+                println!("Request {}: {:?}", i, response);
+                response
+            });
+
+            handles.push(handle);
+        }
+
+        // Await all the handles
+        let results = futures::future::join_all(handles).await;
+
+        // Filter down to unique results, there should be two, 200 and 503
+        let mut response_types: Vec<_> = results
+            .into_iter()
+            .map(|result| match result {
+                Ok(Ok(response)) => {
+                    if response.status() == StatusCode::OK {
+                        "OK"
+                    } else {
+                        "ERROR"
+                    }
+                }
+                Ok(Err(_)) => "ERROR",
+                Err(_) => "ERROR",
+            })
+            .collect();
+
+        println!("Response types: {:?}", response_types);
+
+        // Sort and deduplicate the vector
+        response_types.sort();
+        response_types.dedup();
+
+        assert!(
+            response_types.contains(&"OK") && response_types.contains(&"ERROR"),
+            "Expected both OK and ERROR responses, got: {:?}",
+            response_types
+        );
     }
 }
