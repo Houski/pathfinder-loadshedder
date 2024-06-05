@@ -585,7 +585,7 @@ where
                 Ok(Ok(response)) => Ok(response),
                 Ok(Err(err)) => Err(err),
                 Err(_) => Ok(Response::builder()
-                    .status(StatusCode::REQUEST_TIMEOUT)
+                    .status(StatusCode::GATEWAY_TIMEOUT)
                     .body("Request timed out".into())
                     .unwrap()),
             }
@@ -932,7 +932,7 @@ mod tests {
             .unwrap();
 
         let response = load_shedder.call(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[tokio::test]
@@ -1141,7 +1141,7 @@ mod tests {
                         .map(|r| match r.status() {
                             StatusCode::OK => RequestResult::Fulfilled,
                             StatusCode::SERVICE_UNAVAILABLE => RequestResult::Dropped,
-                            StatusCode::REQUEST_TIMEOUT => RequestResult::TimedOut,
+                            StatusCode::GATEWAY_TIMEOUT => RequestResult::TimedOut,
                             _ => RequestResult::TimedOut,
                         })
                         .unwrap_or(RequestResult::TimedOut);
