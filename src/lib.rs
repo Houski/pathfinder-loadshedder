@@ -430,6 +430,13 @@ impl PathfinderCurrentlyRequestedPaths {
     }
 }
 
+use lazy_static::lazy_static;
+use std::sync::Mutex;
+
+lazy_static! {
+    pub static ref PATHFINDER_503_BODY: Mutex<&'static str> = Mutex::new("");
+}
+
 #[derive(Debug, Clone)]
 pub struct PathfinderLoadShedder<S> {
     max_allowable_system_average_latency_ms: f64,
@@ -499,6 +506,8 @@ where
             }
         };
 
+        let custom_503_body: &str = &PATHFINDER_503_BODY.lock().expect("503 body not set");
+
         Box::pin(async move {
             // Acquire a permit from the semaphore
             let permit = match semaphore.try_acquire() {
@@ -513,7 +522,7 @@ where
                     // Return 503 response
                     return Ok(Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .body("Server is under high load, please try again".into())
+                        .body(custom_503_body.into())
                         .unwrap());
                 }
             };
@@ -547,7 +556,7 @@ where
                         "Retry-After",
                         (max_allowable_system_average_latency_ms / 1000.0).ceil() as u32,
                     )
-                    .body("Server is under high load, please try again".into())
+                    .body(custom_503_body.into())
                     .unwrap());
             }
 
@@ -614,6 +623,11 @@ impl PathfinderLoadShedderLayer {
             max_concurrent_requests,
             timeout_duration_ms,
         }
+    }
+
+    pub fn set_pathfinder_503_body(&self, body: &'static str) -> Self {
+        *PATHFINDER_503_BODY.lock().unwrap() = body;
+        self.clone()
     }
 }
 
@@ -1210,6 +1224,75 @@ mod tests {
             "Expected both OK and ERROR responses, got: {:?}",
             response_types
         );
+    }
+
+    #[tokio::test]
+    async fn test_setting_503_body() {
+        // Create a service that simulates a high load condition by always returning 503
+        let service = service_fn(|_req: Request<Body>| async {
+            // sleep for ten seconds so it 503s every time
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            Ok::<_, hyper::Error>(
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body("Shouldn't see this, as it should load shed this response".into())
+                    .unwrap(),
+            )
+        });
+
+        let custom_html_503_body = r#"
+        <html>
+            <head>
+                <title>Service Unavailable</title>
+            </head>
+            <body>
+                <h1>503 Service Unavailable</h1>
+                <p>Sorry, our server is currently under heavy load. Please try again later.</p>
+            </body>
+        </html>
+        "#;
+
+        let layer = PathfinderLoadShedderLayer::new(500.0, vec!["/test/*"], 1, 1000000.0)
+            .set_pathfinder_503_body(custom_html_503_body);
+
+        let mut load_shedder = layer.layer(service);
+
+        let request = Request::builder()
+            .uri("/test/path")
+            .body(Body::empty())
+            .unwrap();
+
+        // call it twice so it knows average path latency to load shed
+
+        let _ = load_shedder.call(request).await.unwrap();
+
+        let request1 = Request::builder()
+            .uri("/test/path")
+            .body(Body::empty())
+            .unwrap();
+
+        let request2 = Request::builder()
+            .uri("/test/path")
+            .body(Body::empty())
+            .unwrap();
+
+        // call both at once so it load sheds
+
+        let request_out_1 = load_shedder.call(request1);
+        let request_out_2 = load_shedder.call(request2);
+
+        let (_, response2) = tokio::try_join!(request_out_1, request_out_2).unwrap();
+
+        // see if the body matches
+
+        let body = axum::body::to_bytes(response2.into_body(), 10000000000)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        println!("Response body: {}", body);
+
+        assert_eq!(body, custom_html_503_body);
     }
 }
 
