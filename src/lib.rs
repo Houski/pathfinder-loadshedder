@@ -9,13 +9,12 @@ use std::{
 
 use axum::body::Body;
 use hyper::{Request, Response, StatusCode};
-use plotters::prelude::*;
+
 use std::fs::File;
 use std::io::Write;
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
-use tokio::time::sleep;
 use tokio::time::timeout;
 use tower::{Layer, Service};
 
@@ -101,191 +100,6 @@ async fn save_metrics_to_csv(metrics: &Metrics) {
 enum MetricType {
     AveragePathLatency,
     FulfilledVsDroppedVsTimedOut,
-}
-
-fn plot_metrics(
-    metrics: &Metrics,
-    metric_type: MetricType,
-    file_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::time::SystemTime;
-    use std::time::UNIX_EPOCH;
-    let root_area = BitMapBackend::new(file_name, (800, 600)).into_drawing_area();
-    root_area.fill(&WHITE)?;
-
-    // Convert Instant to SystemTime for plotting
-    let system_start_time = SystemTime::now();
-    let min_start_time: SystemTime = metrics
-        .requests
-        .iter()
-        .map(|r| system_start_time - r.start_time.elapsed())
-        .min()
-        .unwrap_or(SystemTime::now());
-    let max_finish_time: SystemTime = metrics
-        .requests
-        .iter()
-        .map(|r| system_start_time - r.finish_time.elapsed())
-        .max()
-        .unwrap_or(SystemTime::now());
-
-    let min_start_time_sec = min_start_time
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64();
-    let max_finish_time_sec = max_finish_time
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64();
-
-    match metric_type {
-        MetricType::AveragePathLatency => {
-            fn x_label_formatter(unix_epoch_time: f64, start_time: f64) -> String {
-                let elapsed_time = unix_epoch_time - start_time;
-                format!("{:.2}", elapsed_time)
-            }
-
-            let mut path_latencies = HashMap::new();
-
-            for request in metrics.requests.iter() {
-                if request.average_path_latency > 0.0 {
-                    path_latencies
-                        .entry(&request.path_transformed)
-                        .or_insert_with(Vec::new)
-                        .push((
-                            system_start_time
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs_f64()
-                                - request.finish_time.elapsed().as_secs_f64(),
-                            request.average_path_latency,
-                        ));
-                }
-            }
-
-            let max_latency = path_latencies
-                .iter()
-                .map(|(_, latencies)| {
-                    latencies
-                        .iter()
-                        .map(|(_, latency)| *latency)
-                        .max_by(|a, b| a.partial_cmp(b).unwrap())
-                        .unwrap()
-                })
-                .max_by(|a, b| a.partial_cmp(b).unwrap())
-                .unwrap();
-
-            let mut ctx = ChartBuilder::on(&root_area)
-                .x_label_area_size(40)
-                .y_label_area_size(80)
-                .caption("Average Path Latency", ("sans-serif", 40))
-                .build_cartesian_2d(
-                    min_start_time_sec..max_finish_time_sec,
-                    0.0..(max_latency * 1.05),
-                )?;
-
-            ctx.configure_mesh()
-                .x_desc("Seconds")
-                .y_desc("Latency (ms)")
-                .axis_desc_style(("sans-serif", 20).into_font())
-                .x_label_formatter(&|x| x_label_formatter(*x, min_start_time_sec))
-                .draw()?;
-
-            let colors = vec![
-                &RED, &BLUE, &GREEN, &YELLOW, &CYAN, &MAGENTA, &BLACK, &WHITE,
-            ];
-
-            for (i, (path, latencies)) in path_latencies.iter().enumerate() {
-                let color = colors[i % colors.len()];
-
-                let smoothed_latencies = latencies
-                    .windows(10)
-                    .map(|window| {
-                        let sum: f64 = window.iter().map(|(_, latency)| *latency).sum();
-                        let count = window.len();
-                        let avg_time =
-                            window.iter().map(|(time, _)| *time).sum::<f64>() / count as f64;
-                        (avg_time, sum / count as f64)
-                    })
-                    .collect::<Vec<_>>();
-
-                ctx.draw_series(LineSeries::new(smoothed_latencies, color))?
-                    .label(path.to_owned())
-                    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], color.clone()));
-            }
-
-            ctx.configure_series_labels()
-                .background_style(&WHITE.mix(0.8))
-                .border_style(&BLACK)
-                .draw()?;
-        }
-        MetricType::FulfilledVsDroppedVsTimedOut => {
-            fn x_label_formatter(unix_epoch_time: f64, start_time: f64) -> String {
-                let elapsed_time = unix_epoch_time - start_time;
-                format!("{:.2}", elapsed_time)
-            }
-
-            let mut fulfilled_count = 0;
-            let mut dropped_count = 0;
-            let mut timed_out_count = 0;
-
-            let mut fulfilled_data = Vec::new();
-            let mut dropped_data = Vec::new();
-            let mut timed_out_data = Vec::new();
-
-            for request in metrics.requests.iter() {
-                let elapsed_time = system_start_time
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs_f64()
-                    - request.finish_time.elapsed().as_secs_f64();
-                match request.result {
-                    RequestResult::Fulfilled => fulfilled_count += 1,
-                    RequestResult::Dropped => dropped_count += 1,
-                    RequestResult::TimedOut => timed_out_count += 1,
-                }
-                fulfilled_data.push((elapsed_time, fulfilled_count as f64));
-                dropped_data.push((elapsed_time, dropped_count as f64));
-                timed_out_data.push((elapsed_time, timed_out_count as f64));
-            }
-
-            let mut ctx = ChartBuilder::on(&root_area)
-                .x_label_area_size(80)
-                .y_label_area_size(80)
-                .caption("Fulfilled vs Dropped vs Timed Out", ("sans-serif", 40))
-                .build_cartesian_2d(
-                    min_start_time_sec..max_finish_time_sec,
-                    0.0..(metrics.requests.len() + 10) as f64,
-                )?;
-
-            ctx.configure_mesh()
-                .x_desc("Seconds")
-                .y_desc("Requests")
-                .axis_desc_style(("sans-serif", 20).into_font()) // Adjust the font size here
-                .x_label_formatter(&|x| x_label_formatter(*x, min_start_time_sec))
-                .draw()?;
-
-            ctx.draw_series(LineSeries::new(dropped_data, &BLUE))?
-                .label("Dropped")
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
-
-            ctx.draw_series(LineSeries::new(timed_out_data, &GREEN))?
-                .label("Timed Out")
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &GREEN));
-
-            ctx.draw_series(LineSeries::new(fulfilled_data, &RED))?
-                .label("Fulfilled")
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
-
-            ctx.configure_series_labels()
-                .background_style(&WHITE.mix(0.8))
-                .border_style(&BLACK)
-                .draw()?;
-        }
-    }
-
-    root_area.present().expect("Unable to save the file");
-
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -647,9 +461,11 @@ impl<S> Layer<S> for PathfinderLoadShedderLayer {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use axum::body::Body;
     use hyper::{Request, Response, StatusCode};
+    use plotters::prelude::*;
     use tower::{service_fn, Service};
 
     #[tokio::test]
@@ -1294,8 +1110,196 @@ mod tests {
 
         assert_eq!(body, custom_html_503_body);
     }
-}
 
-async fn simulate_work(duration_ms: u64) -> () {
-    sleep(Duration::from_millis(duration_ms)).await
+    fn plot_metrics(
+        metrics: &Metrics,
+        metric_type: MetricType,
+        file_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::SystemTime;
+        use std::time::UNIX_EPOCH;
+        let root_area = BitMapBackend::new(file_name, (800, 600)).into_drawing_area();
+        root_area.fill(&WHITE)?;
+
+        // Convert Instant to SystemTime for plotting
+        let system_start_time = SystemTime::now();
+        let min_start_time: SystemTime = metrics
+            .requests
+            .iter()
+            .map(|r| system_start_time - r.start_time.elapsed())
+            .min()
+            .unwrap_or(SystemTime::now());
+        let max_finish_time: SystemTime = metrics
+            .requests
+            .iter()
+            .map(|r| system_start_time - r.finish_time.elapsed())
+            .max()
+            .unwrap_or(SystemTime::now());
+
+        let min_start_time_sec = min_start_time
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let max_finish_time_sec = max_finish_time
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        match metric_type {
+            MetricType::AveragePathLatency => {
+                fn x_label_formatter(unix_epoch_time: f64, start_time: f64) -> String {
+                    let elapsed_time = unix_epoch_time - start_time;
+                    format!("{:.2}", elapsed_time)
+                }
+
+                let mut path_latencies = HashMap::new();
+
+                for request in metrics.requests.iter() {
+                    if request.average_path_latency > 0.0 {
+                        path_latencies
+                            .entry(&request.path_transformed)
+                            .or_insert_with(Vec::new)
+                            .push((
+                                system_start_time
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs_f64()
+                                    - request.finish_time.elapsed().as_secs_f64(),
+                                request.average_path_latency,
+                            ));
+                    }
+                }
+
+                let max_latency = path_latencies
+                    .iter()
+                    .map(|(_, latencies)| {
+                        latencies
+                            .iter()
+                            .map(|(_, latency)| *latency)
+                            .max_by(|a, b| a.partial_cmp(b).unwrap())
+                            .unwrap()
+                    })
+                    .max_by(|a, b| a.partial_cmp(b).unwrap())
+                    .unwrap();
+
+                let mut ctx = ChartBuilder::on(&root_area)
+                    .x_label_area_size(40)
+                    .y_label_area_size(80)
+                    .caption("Average Path Latency", ("sans-serif", 40))
+                    .build_cartesian_2d(
+                        min_start_time_sec..max_finish_time_sec,
+                        0.0..(max_latency * 1.05),
+                    )?;
+
+                ctx.configure_mesh()
+                    .x_desc("Seconds")
+                    .y_desc("Latency (ms)")
+                    .axis_desc_style(("sans-serif", 20).into_font())
+                    .x_label_formatter(&|x| x_label_formatter(*x, min_start_time_sec))
+                    .draw()?;
+
+                let colors = vec![
+                    &RED, &BLUE, &GREEN, &YELLOW, &CYAN, &MAGENTA, &BLACK, &WHITE,
+                ];
+
+                for (i, (path, latencies)) in path_latencies.iter().enumerate() {
+                    let color = colors[i % colors.len()];
+
+                    let smoothed_latencies = latencies
+                        .windows(10)
+                        .map(|window| {
+                            let sum: f64 = window.iter().map(|(_, latency)| *latency).sum();
+                            let count = window.len();
+                            let avg_time =
+                                window.iter().map(|(time, _)| *time).sum::<f64>() / count as f64;
+                            (avg_time, sum / count as f64)
+                        })
+                        .collect::<Vec<_>>();
+
+                    ctx.draw_series(LineSeries::new(smoothed_latencies, color))?
+                        .label(path.to_owned())
+                        .legend(|(x, y)| {
+                            PathElement::new(vec![(x, y), (x + 20, y)], color.clone())
+                        });
+                }
+
+                ctx.configure_series_labels()
+                    .background_style(&WHITE.mix(0.8))
+                    .border_style(&BLACK)
+                    .draw()?;
+            }
+            MetricType::FulfilledVsDroppedVsTimedOut => {
+                fn x_label_formatter(unix_epoch_time: f64, start_time: f64) -> String {
+                    let elapsed_time = unix_epoch_time - start_time;
+                    format!("{:.2}", elapsed_time)
+                }
+
+                let mut fulfilled_count = 0;
+                let mut dropped_count = 0;
+                let mut timed_out_count = 0;
+
+                let mut fulfilled_data = Vec::new();
+                let mut dropped_data = Vec::new();
+                let mut timed_out_data = Vec::new();
+
+                for request in metrics.requests.iter() {
+                    let elapsed_time = system_start_time
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64()
+                        - request.finish_time.elapsed().as_secs_f64();
+                    match request.result {
+                        RequestResult::Fulfilled => fulfilled_count += 1,
+                        RequestResult::Dropped => dropped_count += 1,
+                        RequestResult::TimedOut => timed_out_count += 1,
+                    }
+                    fulfilled_data.push((elapsed_time, fulfilled_count as f64));
+                    dropped_data.push((elapsed_time, dropped_count as f64));
+                    timed_out_data.push((elapsed_time, timed_out_count as f64));
+                }
+
+                let mut ctx = ChartBuilder::on(&root_area)
+                    .x_label_area_size(80)
+                    .y_label_area_size(80)
+                    .caption("Fulfilled vs Dropped vs Timed Out", ("sans-serif", 40))
+                    .build_cartesian_2d(
+                        min_start_time_sec..max_finish_time_sec,
+                        0.0..(metrics.requests.len() + 10) as f64,
+                    )?;
+
+                ctx.configure_mesh()
+                    .x_desc("Seconds")
+                    .y_desc("Requests")
+                    .axis_desc_style(("sans-serif", 20).into_font()) // Adjust the font size here
+                    .x_label_formatter(&|x| x_label_formatter(*x, min_start_time_sec))
+                    .draw()?;
+
+                ctx.draw_series(LineSeries::new(dropped_data, &BLUE))?
+                    .label("Dropped")
+                    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+
+                ctx.draw_series(LineSeries::new(timed_out_data, &GREEN))?
+                    .label("Timed Out")
+                    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &GREEN));
+
+                ctx.draw_series(LineSeries::new(fulfilled_data, &RED))?
+                    .label("Fulfilled")
+                    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+
+                ctx.configure_series_labels()
+                    .background_style(&WHITE.mix(0.8))
+                    .border_style(&BLACK)
+                    .draw()?;
+            }
+        }
+
+        root_area.present().expect("Unable to save the file");
+
+        Ok(())
+    }
+
+    async fn simulate_work(duration_ms: u64) -> () {
+        use tokio::time::sleep;
+        sleep(Duration::from_millis(duration_ms)).await
+    }
 }
