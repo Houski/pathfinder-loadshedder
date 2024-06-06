@@ -314,8 +314,17 @@ where
             Some(p) => p,
             None => {
                 return Box::pin(async move {
-                    let res = fut.await?;
-                    Ok(res)
+                    // timeout should affect all routes, so it's here as well.
+                    let res = timeout(timeout_duration, fut).await;
+
+                    match res {
+                        Ok(Ok(response)) => Ok(response),
+                        Ok(Err(err)) => Err(err),
+                        Err(_) => Ok(Response::builder()
+                            .status(StatusCode::GATEWAY_TIMEOUT)
+                            .body("Request timed out".into())
+                            .unwrap()),
+                    }
                 });
             }
         };
