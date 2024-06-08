@@ -405,11 +405,10 @@ where
 
                 let mut expected_time_until_processed = 0.0;
                 for request in queue.iter_mut() {
-                    // println!(
-                    //     "Uuid: {}: Expected time until processing: {}, expected_average_latency: {}",
-                    //     request.uuid,
-                    //     expected_time_until_processed, request.expected_average_latency
-                    // );
+                    println!(
+                        "Uuid: {}: Expected time until processing: {}",
+                        request.uuid, expected_time_until_processed,
+                    );
                     expected_time_until_processed += request.expected_average_latency;
                     request.expected_time_until_processed = expected_time_until_processed;
                 }
@@ -480,13 +479,15 @@ where
                 Body::from(this_request.body.clone()),
             );
 
-            let start_time = Instant::now();
-
             let mut queue = queue_arc.write().await;
 
             let mut path_latencies = path_latencies.write().await;
 
+            let start_time = Instant::now();
+
             let res = timeout(timeout_duration, inner.call(new_req)).await;
+
+            let end_time = start_time.elapsed().as_millis() as f32;
 
             let position = queue.iter().position(|r| r.uuid == uuid);
 
@@ -500,7 +501,7 @@ where
                 Ok(Ok(response)) => {
                     path_latencies.update_path_latency(&normalized_path, {
                         // cap latency to avoid total system lockup if request takes super long time
-                        let latency = start_time.elapsed().as_millis() as f32;
+                        let latency = end_time;
                         if latency >= max_expected_time_until_processed - 1.0 {
                             max_expected_time_until_processed - 1.0
                         } else {
@@ -1172,6 +1173,78 @@ mod tests {
         let latency = paths.get_path_average_latency("/test/*");
 
         assert_eq!(latency, 239.0);
+    }
+
+    #[tokio::test]
+    async fn test_burst_recovery() {
+        let service = service_fn(|_req: Request<Body>| async {
+            // Simulate some processing time
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
+        });
+
+        let layer = PathfinderLoadShedderLayer::new(
+            550.0,
+            vec![PathfinderPath {
+                path: "/test/*",
+                initialization_latency_ms: 100.0,
+            }],
+            1,      // Max concurrent requests
+            1000.0, // Timeout duration
+        );
+
+        let load_shedder = layer.layer(service);
+
+        let request = || {
+            Request::builder()
+                .uri("/test/path")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Simulate burst of requests causing 503 responses
+        let mut responses = Vec::new();
+        for _ in 0..10 {
+            let mut shedder = load_shedder.clone();
+            let req = request();
+            responses.push(tokio::spawn(async move { shedder.call(req).await }));
+        }
+
+        // Await responses and check for 503s
+        let results = futures::future::join_all(responses).await;
+        let mut count_503 = 0;
+        for result in results {
+            if let Ok(Ok(response)) = result {
+                if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                    count_503 += 1;
+                }
+            }
+        }
+        assert!(count_503 > 0, "Expected some 503 responses during burst");
+
+        // Wait for a short delay to allow system recovery
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Send more requests to check for recovery
+        let mut recovery_responses = Vec::new();
+        for _ in 0..2 {
+            let mut shedder = load_shedder.clone();
+            let req = request();
+            recovery_responses.push(tokio::spawn(async move { shedder.call(req).await }));
+        }
+
+        // Await recovery responses and check for 200 OK
+        let recovery_results = futures::future::join_all(recovery_responses).await;
+
+        let mut count_200 = 0;
+        for result in recovery_results {
+            if let Ok(Ok(response)) = result {
+                if response.status() == StatusCode::OK {
+                    count_200 += 1;
+                }
+            }
+        }
+        assert_eq!(count_200, 2, "Expected all recovery responses to be 200 OK");
     }
 
     #[tokio::test]
