@@ -110,8 +110,8 @@ enum MetricType {
 
 #[derive(Clone, Debug)]
 pub struct PathfinderPath {
-    path: &'static str,
-    initialization_latency_ms: f32,
+    pub path: &'static str,
+    pub initialization_latency_ms: f32,
 }
 
 #[derive(Clone, Debug)]
