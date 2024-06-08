@@ -449,20 +449,20 @@ where
                     queue.remove(pos);
                 }
 
-                // get the average and then minus 10% to avoid forever lockups
+                // put the latency as 1 to avoid to avoid forever lockups
 
-                let average_path_latency = path_latencies
-                    .read()
-                    .await
-                    .get_path_average_latency(&normalized_path);
+                // let average_path_latency = path_latencies
+                //     .read()
+                //     .await
+                //     .get_path_average_latency(&normalized_path);
 
-                let average_path_latency_minus_10_percent =
-                    average_path_latency - (average_path_latency * 0.1);
+                // let average_path_latency_minus_10_percent =
+                //     average_path_latency - (average_path_latency * 0.1);
 
-                path_latencies
-                    .write()
-                    .await
-                    .update_path_latency(&normalized_path, average_path_latency_minus_10_percent);
+                // path_latencies
+                //     .write()
+                //     .await
+                //     .update_path_latency(&normalized_path, 1.0);
 
                 return Ok(Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -530,12 +530,12 @@ where
                 Ok(Ok(response)) => {
                     path_latencies.update_path_latency(&normalized_path, {
                         // cap latency to avoid total system lockup if request takes super long time
-                        start_time.elapsed().as_millis() as f32
-                        // if latency >= max_expected_time_until_processed - 1.0 {
-                        //     max_expected_time_until_processed - 1.0
-                        // } else {
-                        //     latency
-                        // }
+                        let latency = start_time.elapsed().as_millis() as f32;
+                        if latency >= max_expected_time_until_processed - 1.0 {
+                            max_expected_time_until_processed - 1.0
+                        } else {
+                            latency
+                        }
                     });
 
                     return Ok(response);
@@ -1164,6 +1164,44 @@ mod tests {
                 path.path
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_latency_capping() {
+        let service = service_fn(|_req: Request<Body>| async {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
+        });
+
+        let layer = PathfinderLoadShedderLayer::new(
+            240.0,
+            vec![PathfinderPath {
+                path: "/test/*",
+                initialization_latency_ms: 239.0,
+            }],
+            1,
+            1000.0,
+        );
+
+        let request = Request::builder()
+            .uri("/test/path")
+            .body(Body::empty())
+            .unwrap();
+
+        // latency registered should 240 ms - 1 ms, because the longest a request's latency can be is the max time allowed minus 1 ms.
+        // This avoids lock ups where no requests can be made as the average latency to load the page is already over the max allowed.
+
+        let mut load_shedder = layer.layer(service);
+
+        let response = load_shedder.call(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let paths = load_shedder.path_latencies.read().await;
+
+        let latency = paths.get_path_average_latency("/test/*");
+
+        assert_eq!(latency, 239.0);
     }
 
     #[tokio::test]
