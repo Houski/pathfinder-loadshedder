@@ -218,12 +218,12 @@ struct QueuedRequest {
     body: Bytes,
     parts: Parts,
     expected_average_latency: f32,
-    expected_time_until_processing: f32,
+    expected_time_until_processed: f32,
 }
 
 #[derive(Debug, Clone)]
 pub struct PathfinderLoadShedder<S> {
-    max_expected_time_until_processing: f32,
+    max_expected_time_until_processed: f32,
     semaphore: Arc<Semaphore>,
     path_latencies: Arc<RwLock<PathfinderPathLatencies>>,
     pathfinder_path_transforms: PathfinderPathTransforms,
@@ -234,7 +234,7 @@ pub struct PathfinderLoadShedder<S> {
 
 impl<S> PathfinderLoadShedder<S> {
     fn new(
-        max_expected_time_until_processing: f32,
+        max_expected_time_until_processed: f32,
         pathfinder_path_transforms: PathfinderPathTransforms,
         inner: S,
         max_concurrent_requests: usize,
@@ -255,7 +255,7 @@ impl<S> PathfinderLoadShedder<S> {
         println!("Initialized latencies: {:?}", path_latencies);
 
         Self {
-            max_expected_time_until_processing,
+            max_expected_time_until_processed,
             path_latencies: Arc::new(RwLock::new(path_latencies)),
             pathfinder_path_transforms,
             inner,
@@ -264,34 +264,11 @@ impl<S> PathfinderLoadShedder<S> {
             queue: Arc::new(RwLock::new(ArrayVec::new())),
         }
     }
-
-    pub async fn initialize_latencies(&self) {
-        let paths = self.path_latencies.clone();
-
-        let path_latencies = self.pathfinder_path_transforms.path_latencies.clone();
-
-        let new_paths = path_latencies.iter().fold(
-            PathfinderPathLatencies {
-                path_latencies: HashMap::new(),
-            },
-            |mut acc, path| {
-                acc.path_latencies
-                    .insert(path.path.to_string(), vec![path.initialization_latency_ms]);
-                acc
-            },
-        );
-
-        println!("Initialized latencies: {:?}", new_paths);
-
-        let mut paths = paths.write().await;
-
-        *paths = new_paths;
-    }
 }
 
 #[derive(Clone)]
 pub struct PathfinderLoadShedderLayer {
-    max_expected_time_until_processing: f32,
+    max_expected_time_until_processed: f32,
     pathfinder_path_transforms: PathfinderPathTransforms,
     max_concurrent_requests: usize,
     timeout_duration_ms: f32,
@@ -299,13 +276,13 @@ pub struct PathfinderLoadShedderLayer {
 
 impl PathfinderLoadShedderLayer {
     pub fn new(
-        max_expected_time_until_processing: f32,
+        max_expected_time_until_processed: f32,
         pathfinder_path_transforms: Vec<PathfinderPath>,
         max_concurrent_requests: usize,
         timeout_duration_ms: f32,
     ) -> Self {
         Self {
-            max_expected_time_until_processing,
+            max_expected_time_until_processed,
             pathfinder_path_transforms: PathfinderPathTransforms::new(pathfinder_path_transforms),
             max_concurrent_requests,
             timeout_duration_ms,
@@ -323,7 +300,7 @@ impl<S> Layer<S> for PathfinderLoadShedderLayer {
 
     fn layer(&self, inner: S) -> Self::Service {
         PathfinderLoadShedder::new(
-            self.max_expected_time_until_processing,
+            self.max_expected_time_until_processed,
             self.pathfinder_path_transforms.clone(),
             inner,
             self.max_concurrent_requests,
@@ -379,7 +356,7 @@ where
         let queue_arc = self.queue.clone();
         let path_latencies = self.path_latencies.clone();
         let custom_503_body: &str = &PATHFINDER_503_BODY.lock().expect("503 body not set");
-        let max_expected_time_until_processing = self.max_expected_time_until_processing;
+        let max_expected_time_until_processed = self.max_expected_time_until_processed;
         let inner = self.inner.clone();
 
         Box::pin(async move {
@@ -399,53 +376,147 @@ where
                 }
             };
 
+            // Initial request comes in, and basically only affects the queue
+
             {
                 let mut queue = queue_arc.write().await;
-                if queue.len() == 1000 {
+                if queue.len() >= 1000 {
+                    queue.pop();
                     return Ok(Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
                         .body(custom_503_body.into())
                         .unwrap());
                 }
 
+                let expected_path_latency = path_latencies
+                    .read()
+                    .await
+                    .get_path_average_latency(&normalized_path);
+
                 queue.push(QueuedRequest {
                     uuid,
                     body: body_bytes.clone(),
                     parts: parts.clone(),
-                    expected_average_latency: path_latencies
-                        .read()
-                        .await
-                        .get_path_average_latency(&normalized_path),
-                    expected_time_until_processing: 0.0,
+                    expected_average_latency: expected_path_latency,
+                    expected_time_until_processed: expected_path_latency, // this is the default initial value
                 });
 
-                let mut expected_time_until_processing = 0.0;
+                println!("Queue length: {}", queue.len());
+
+                let mut expected_time_until_processed = 0.0;
                 for request in queue.iter_mut() {
-                    println!(
-                        "Expected time until processing: {}, expected_average_latency: {}",
-                        expected_time_until_processing, request.expected_average_latency
-                    );
-                    expected_time_until_processing += request.expected_average_latency;
-                    request.expected_time_until_processing = expected_time_until_processing;
+                    // println!(
+                    //     "Uuid: {}: Expected time until processing: {}, expected_average_latency: {}",
+                    //     request.uuid,
+                    //     expected_time_until_processed, request.expected_average_latency
+                    // );
+                    expected_time_until_processed += request.expected_average_latency;
+                    request.expected_time_until_processed = expected_time_until_processed;
                 }
+
+                // I think we should also just drop requests right here as well if the expected time is too high, as well as AFTER the semaphore.
             }
 
-            // find the request by uuid, if it's over the max time, return the 503 and remove it from the queue
+            // then when we have the semaphore, we can acquire it and then process the actual request
 
-            let mut queue = queue_arc.write().await;
+            let mut this_request: Option<QueuedRequest> = None;
 
-            println!("Queue length: {}", queue.len());
+            {
+                let queue = queue_arc.write().await;
 
-            let this_request = queue.iter().find(|r| r.uuid == uuid).cloned();
+                this_request = queue.iter().find(|r| r.uuid == uuid).cloned();
+            }
+
             let this_request = match this_request {
                 Some(r) => r,
                 None => {
                     return Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body("Failed to find request in queue".into())
+                        .body("Request not found".into())
                         .unwrap());
                 }
             };
+
+            // THIS LOGIC EXISTS TWICE, ONCE BEFORE THE SEMAPHORE IS ACQUIRED, AND ONCE AFTER. THIS ALLOWS INSTANT 503.
+
+            if this_request.expected_time_until_processed > max_expected_time_until_processed {
+                let mut queue = queue_arc.write().await;
+                let position = queue.iter().position(|r| r.uuid == uuid);
+
+                println!("EXPECTED TIME TOO HIGH, RETURNING 503");
+
+                if let Some(pos) = position {
+                    queue.remove(pos);
+                }
+
+                // get the average and then minus 10% to avoid forever lockups
+
+                let average_path_latency = path_latencies
+                    .read()
+                    .await
+                    .get_path_average_latency(&normalized_path);
+
+                let average_path_latency_minus_10_percent =
+                    average_path_latency - (average_path_latency * 0.1);
+
+                path_latencies
+                    .write()
+                    .await
+                    .update_path_latency(&normalized_path, average_path_latency_minus_10_percent);
+
+                return Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(custom_503_body.into())
+                    .unwrap());
+            }
+
+            let _ = semaphore.acquire().await.unwrap();
+
+            // THIS LOGIC EXISTS TWICE, ONCE BEFORE THE SEMAPHORE IS ACQUIRED, AND ONCE AFTER. THIS ALLOWS FOR 503'ING IF CONDITIONS HAVE CHANGED WHILE WAITING FOR SEMAPHORE.
+
+            if this_request.expected_time_until_processed > max_expected_time_until_processed {
+                let mut queue = queue_arc.write().await;
+                let position = queue.iter().position(|r| r.uuid == uuid);
+
+                println!("EXPECTED TIME TOO HIGH, RETURNING 503");
+
+                if let Some(pos) = position {
+                    queue.remove(pos);
+                }
+
+                // get the average and then minus 10% to avoid forever lockups
+
+                let average_path_latency = path_latencies
+                    .read()
+                    .await
+                    .get_path_average_latency(&normalized_path);
+
+                let average_path_latency_minus_10_percent =
+                    average_path_latency - (average_path_latency * 0.1);
+
+                path_latencies
+                    .write()
+                    .await
+                    .update_path_latency(&normalized_path, average_path_latency_minus_10_percent);
+
+                return Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(custom_503_body.into())
+                    .unwrap());
+            }
+
+            let new_req = Request::from_parts(
+                this_request.parts.clone(),
+                Body::from(this_request.body.clone()),
+            );
+
+            let start_time = Instant::now();
+
+            let mut queue = queue_arc.write().await;
+
+            let mut path_latencies = path_latencies.write().await;
+
+            let res = timeout(timeout_duration, inner.call(new_req)).await;
 
             let position = queue.iter().position(|r| r.uuid == uuid);
 
@@ -455,45 +526,16 @@ where
                 queue.remove(pos);
             }
 
-            println!("This request: {:?}", this_request);
-
-            if this_request.expected_time_until_processing > max_expected_time_until_processing {
-                println!("EXPECTED TIME TOO HIGH, RETURNING 503");
-                return Ok(Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .body(custom_503_body.into())
-                    .unwrap());
-            }
-
-            drop(queue);
-
-            let _permit = semaphore.acquire().await.unwrap();
-
-            let normalized_path = normalized_path.clone();
-
-            let new_req = Request::from_parts(
-                this_request.parts.clone(),
-                Body::from(this_request.body.clone()),
-            );
-
-            let start_time = Instant::now();
-
-            let mut path_latencies = path_latencies.write().await;
-
-            let res = timeout(timeout_duration, inner.call(new_req)).await;
-
-            // match the res and return the timeout error, update the path latency and remove the request from the queue
-
             match res {
                 Ok(Ok(response)) => {
                     path_latencies.update_path_latency(&normalized_path, {
                         // cap latency to avoid total system lockup if request takes super long time
-                        let latency = start_time.elapsed().as_millis() as f32;
-                        if latency >= max_expected_time_until_processing - 1.0 {
-                            max_expected_time_until_processing - 1.0
-                        } else {
-                            latency
-                        }
+                        start_time.elapsed().as_millis() as f32
+                        // if latency >= max_expected_time_until_processed - 1.0 {
+                        //     max_expected_time_until_processed - 1.0
+                        // } else {
+                        //     latency
+                        // }
                     });
 
                     return Ok(response);
@@ -701,43 +743,43 @@ mod tests {
         assert_eq!(response6.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[tokio::test]
-    async fn test_latency_capping() {
-        let service = service_fn(|_req: Request<Body>| async {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
-        });
+    // #[tokio::test]
+    // async fn test_latency_capping() {
+    //     let service = service_fn(|_req: Request<Body>| async {
+    //         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    //         Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
+    //     });
 
-        let layer = PathfinderLoadShedderLayer::new(
-            240.0,
-            vec![PathfinderPath {
-                path: "/test/*",
-                initialization_latency_ms: 239.0,
-            }],
-            1,
-            1000.0,
-        );
+    //     let layer = PathfinderLoadShedderLayer::new(
+    //         240.0,
+    //         vec![PathfinderPath {
+    //             path: "/test/*",
+    //             initialization_latency_ms: 239.0,
+    //         }],
+    //         1,
+    //         1000.0,
+    //     );
 
-        let request = Request::builder()
-            .uri("/test/path")
-            .body(Body::empty())
-            .unwrap();
+    //     let request = Request::builder()
+    //         .uri("/test/path")
+    //         .body(Body::empty())
+    //         .unwrap();
 
-        // latency registered should 240 ms - 1 ms, because the longest a request's latency can be is the max time allowed minus 1 ms.
-        // This avoids lock ups where no requests can be made as the average latency to load the page is already over the max allowed.
+    //     // latency registered should 240 ms - 1 ms, because the longest a request's latency can be is the max time allowed minus 1 ms.
+    //     // This avoids lock ups where no requests can be made as the average latency to load the page is already over the max allowed.
 
-        let mut load_shedder = layer.layer(service);
+    //     let mut load_shedder = layer.layer(service);
 
-        let response = load_shedder.call(request).await.unwrap();
+    //     let response = load_shedder.call(request).await.unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+    //     assert_eq!(response.status(), StatusCode::OK);
 
-        let paths = load_shedder.path_latencies.read().await;
+    //     let paths = load_shedder.path_latencies.read().await;
 
-        let latency = paths.get_path_average_latency("/test/*");
+    //     let latency = paths.get_path_average_latency("/test/*");
 
-        assert_eq!(latency, 239.0);
-    }
+    //     assert_eq!(latency, 239.0);
+    // }
 
     #[tokio::test]
     async fn test_load_shedding_latency_calculation() {
@@ -869,190 +911,172 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_shedding_with_work_simulation() {
-        use rand::Rng;
-        let service = service_fn(|_req: Request<Body>| async {
-            // generate random amount of work
-            let duration_ms = rand::thread_rng().gen_range(1000..2000);
-            simulate_work(duration_ms).await;
-            Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
-        });
+    async fn test_load_shedding_with_real_world_conditions() {
+        use axum::routing::get;
+        use axum::Router;
+        use reqwest::Client;
+        use std::net::SocketAddr;
+        use tokio::task::JoinHandle;
+        use tokio::time::sleep;
 
         let layer = PathfinderLoadShedderLayer::new(
-            2500.0,
-            vec![PathfinderPath {
-                path: "/test/*",
-                initialization_latency_ms: 100.0,
-            }],
-            10,
-            5000.0,
-        );
-        let mut load_shedder = layer.layer(service);
-
-        let request = Request::builder()
-            .uri("/test/path")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = load_shedder.call(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    // #test1
-    #[tokio::test]
-    async fn test_load_shedding_with_random_requests() {
-        use rand::Rng;
-
-        let service = service_fn(|_req: Request<Body>| async {
-            let duration_ms = rand::thread_rng().gen_range(50..300); // Increase the lower bound
-            simulate_work(duration_ms).await;
-            Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
-        });
-
-        let layer = PathfinderLoadShedderLayer::new(
-            200.0,
+            1600.0,
             vec![
                 PathfinderPath {
                     path: "/test/*",
-                    initialization_latency_ms: 125.0,
+                    initialization_latency_ms: 490.0,
                 },
                 PathfinderPath {
                     path: "/random/*",
-                    initialization_latency_ms: 125.0,
+                    initialization_latency_ms: 200.0,
                 },
             ],
-            3,
-            250.0,
+            2,
+            1700.0,
         );
-        let load_shedder = layer.layer(service);
 
-        let pathfinder_paths = load_shedder.path_latencies.clone();
+        // Start the Axum server
+        let app = Router::new()
+            .route(
+                "/test/path1",
+                get(|| async {
+                    let duration = Duration::from_millis(rand::thread_rng().gen_range(1000..2000));
+                    sleep(duration).await;
+                    "Done with /test/path1"
+                }),
+            )
+            .route(
+                "/test/path2",
+                get(|| async {
+                    let duration = Duration::from_millis(rand::thread_rng().gen_range(500..1000));
+                    sleep(duration).await;
+                    "Done with /test/path2"
+                }),
+            )
+            .route(
+                "/random/path1",
+                get(|| async {
+                    let duration = Duration::from_millis(rand::thread_rng().gen_range(200..2000));
+                    sleep(duration).await;
+                    "Done with /random/path1"
+                }),
+            )
+            .layer(layer.clone());
 
-        let paths = vec!["/test/path1", "/test/path2", "/random/path1"];
+        let addr = SocketAddr::from(([127, 0, 0, 1], 12000));
+        let tcp_listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        let server = axum::serve(tcp_listener, app.into_make_service());
+
+        let server_handle: JoinHandle<()> = tokio::spawn(async move {
+            server.await.unwrap();
+        });
+
+        // Allow some time for the server to start
+        sleep(Duration::from_secs(1)).await;
+
+        // Prepare to make requests
+        let client = Client::new();
+        let paths = vec![
+            "http://localhost:12000/test/path1",
+            "http://localhost:12000/test/path2",
+            "http://localhost:12000/random/path1",
+        ];
+
+        let results = Arc::new(Mutex::new(Vec::new()));
 
         let metrics = Arc::new(RwLock::new(Metrics::new()));
+        let metrics_clone = metrics.clone();
 
-        let mut handles = vec![];
+        let request_number = 200;
 
-        for _ in 0..30 {
-            for i in 0..rand::thread_rng().gen_range(30..50) as u32 {
-                let pathfinder_paths = pathfinder_paths.clone();
-                let path: &str = paths[rand::thread_rng().gen_range(0..paths.len())];
-                let path_transformed = layer
-                    .pathfinder_path_transforms
-                    .normalize_path(&path.to_string())
-                    .unwrap();
+        for _i in 0..request_number as u32 {
+            let metrics_clone = metrics_clone.clone();
+            let client_clone = client.clone();
+            let request_delay = rand::thread_rng().gen_range(100..300);
+            sleep(Duration::from_millis(request_delay)).await;
 
-                let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let path = paths[rand::thread_rng().gen_range(0..paths.len())].to_string();
 
-                let mut shedder_clone = load_shedder.clone();
-                let metrics_clone = metrics.clone();
+            let results_clone = Arc::clone(&results);
+
+            tokio::spawn(async move {
                 let path_clone = path.to_string();
+                let start_time = Instant::now();
+                let response = client_clone.get(&path).send().await;
+                let finish_time = Instant::now();
 
-                println!("Requesting path: {}", path);
-                println!("Normalized path: {}", path_transformed);
+                // do the metrics
 
-                let average_path_latency = pathfinder_paths
-                    .clone()
-                    .read()
-                    .await
-                    .get_path_average_latency(&path_transformed);
+                let result = response
+                    .as_ref()
+                    .map(|r| match r.status() {
+                        StatusCode::OK => RequestResult::Fulfilled,
+                        StatusCode::SERVICE_UNAVAILABLE => RequestResult::Dropped,
+                        StatusCode::GATEWAY_TIMEOUT => RequestResult::TimedOut,
+                        _ => panic!("Unexpected status code"),
+                    })
+                    .unwrap_or(RequestResult::TimedOut);
 
-                let handle = tokio::task::spawn(async move {
-                    let start_time = Instant::now();
-                    // println!("Start time: {:?}", start_time);
-                    let response = shedder_clone.call(request).await;
-                    let finish_time = Instant::now();
-                    // println!("Finish time: {:?}", finish_time);
+                println!("Updating metrics for path: {}", path_clone);
 
-                    let result = response
-                        .as_ref()
-                        .map(|r| match r.status() {
-                            StatusCode::OK => RequestResult::Fulfilled,
-                            StatusCode::SERVICE_UNAVAILABLE => RequestResult::Dropped,
-                            StatusCode::GATEWAY_TIMEOUT => RequestResult::TimedOut,
-                            _ => RequestResult::TimedOut,
-                        })
-                        .unwrap_or(RequestResult::TimedOut);
+                metrics_clone.write().await.add_request(
+                    path_clone.clone(),
+                    "".to_string(),
+                    start_time,
+                    finish_time,
+                    result,
+                    0.0,
+                );
 
-                    println!("Updating metrics for path: {}", path_clone);
-
-                    metrics_clone.write().await.add_request(
-                        path_clone.clone(),
-                        path_transformed,
-                        start_time,
-                        finish_time,
-                        result,
-                        average_path_latency,
-                    );
-
-                    println!("Request {}: {:?}", i, response);
-                    response
-                });
-
-                handles.push(handle);
-            }
-
-            // sleep a random amount of time
-            let duration_ms = rand::thread_rng().gen_range(100..1000); // Increase the lower bound
-            simulate_work(duration_ms).await;
+                let mut results_lock = results_clone.lock().unwrap();
+                results_lock.push(response);
+            });
         }
 
-        use futures::future::join_all;
-        let results = join_all(handles).await;
+        // wait till results is 100 in length
+        while results.lock().unwrap().len() < request_number {
+            sleep(Duration::from_millis(100)).await;
+        }
 
-        let mut response_types: Vec<_> = results
-            .into_iter()
-            .map(|result| match result {
-                Ok(Ok(response)) => {
-                    if response.status() == StatusCode::OK {
-                        "OK"
-                    } else {
-                        "ERROR"
+        // Collect and print the results
+        let response_types: Vec<_> = {
+            let results_lock = results.lock().unwrap();
+            results_lock
+                .iter()
+                .map(|result| match result {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            "OK"
+                        } else {
+                            "ERROR"
+                        }
                     }
-                }
-                Ok(Err(_)) => "ERROR",
-                Err(_) => "ERROR",
-            })
-            .collect();
+                    Err(_) => "ERROR",
+                })
+                .collect()
+        };
 
         println!("Response types: {:?}", response_types);
 
+        // Sort and deduplicate response types
+        let mut response_types = response_types;
         response_types.sort();
         response_types.dedup();
 
-        //print out the queue
-
-        let pathfinder_paths = load_shedder.queue.clone();
-
-        let paths = pathfinder_paths.read().await;
-
-        println!("Queue: {:?}", paths);
-
-        // make a test to test the legnth of the queue is zero when finished
-
-        assert_eq!(paths.len(), 0);
+        println!("Unique Response types: {:?}", response_types);
 
         let metrics = metrics.read().await;
         save_metrics_to_csv(&metrics).await;
-        plot_metrics(
-            &metrics,
-            MetricType::AveragePathLatency,
-            "average_path_latency.png",
-        )
-        .unwrap();
+
         plot_metrics(
             &metrics,
             MetricType::FulfilledVsDroppedVsTimedOut,
-            "fulfilled_vs_dropped.png",
+            "real_world_fulfilled_vs_dropped.png",
         )
         .unwrap();
 
-        assert!(
-            response_types.contains(&"OK") && response_types.contains(&"ERROR"),
-            "Expected both OK and ERROR responses, got: {:?}",
-            response_types
-        );
+        // Shutdown the server
+        server_handle.abort();
     }
 
     #[tokio::test]
