@@ -363,15 +363,15 @@ where
             let mut inner = inner.clone();
             let uuid = Uuid::new_v4();
             let path_latencies = path_latencies.clone();
-            let one_tenth_mb = (1 * 1024 * 1024) / 10;
+
             let (parts, body) = req.into_parts();
-            let body_bytes = to_bytes(body, one_tenth_mb).await;
+            let body_bytes = to_bytes(body, 0).await;
             let body_bytes = match body_bytes {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     return Ok(Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body("Failed to read request body".into())
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .body("".into())
                         .unwrap());
                 }
             };
@@ -908,6 +908,37 @@ mod tests {
             "Expected both OK and ERROR responses, got: {:?}",
             response_types
         );
+    }
+
+    #[tokio::test]
+    async fn test_body_size_limit_exceeded() {
+        let service = service_fn(|_req: Request<Body>| async {
+            Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
+        });
+
+        let layer = PathfinderLoadShedderLayer::new(
+            500.0,
+            vec![PathfinderPath {
+                path: "/test/*",
+                initialization_latency_ms: 100.0,
+            }],
+            1,
+            1000.0,
+        );
+
+        let mut load_shedder = layer.layer(service);
+
+        let large_body = vec![0; 1_000_000]; // 1 MB body
+
+        let request = Request::builder()
+            .uri("/test/path")
+            .body(Body::from(large_body))
+            .unwrap();
+
+        let response = load_shedder.call(request).await.unwrap();
+
+        // Verify that the response is a 413 Payload Too Large
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
