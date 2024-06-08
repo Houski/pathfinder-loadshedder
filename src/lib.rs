@@ -398,19 +398,19 @@ where
                     body: body_bytes.clone(),
                     parts: parts.clone(),
                     expected_average_latency: expected_path_latency,
-                    expected_time_until_processed: 0.0, // this is the default initial value
+                    expected_time_until_processed: expected_path_latency, // this is the default initial value
                 });
 
                 println!("Queue length: {}", queue.len());
 
                 let mut expected_time_until_processed = 0.0;
                 for request in queue.iter_mut() {
-                    println!(
-                        "Uuid: {}: Expected time until processing: {}",
-                        request.uuid, expected_time_until_processed,
-                    );
                     expected_time_until_processed += request.expected_average_latency;
                     request.expected_time_until_processed = expected_time_until_processed;
+                    println!(
+                        "Uuid: {}: Expected time until processed: {}",
+                        request.uuid, expected_time_until_processed,
+                    );
                 }
 
                 // I think we should also just drop requests right here as well if the expected time is too high, as well as AFTER the semaphore.
