@@ -398,7 +398,7 @@ where
                     body: body_bytes.clone(),
                     parts: parts.clone(),
                     expected_average_latency: expected_path_latency,
-                    expected_time_until_processed: expected_path_latency, // this is the default initial value
+                    expected_time_until_processed: 0.0, // this is the default initial value
                 });
 
                 println!("Queue length: {}", queue.len());
@@ -449,21 +449,6 @@ where
                     queue.remove(pos);
                 }
 
-                // put the latency as 1 to avoid to avoid forever lockups
-
-                // let average_path_latency = path_latencies
-                //     .read()
-                //     .await
-                //     .get_path_average_latency(&normalized_path);
-
-                // let average_path_latency_minus_10_percent =
-                //     average_path_latency - (average_path_latency * 0.1);
-
-                // path_latencies
-                //     .write()
-                //     .await
-                //     .update_path_latency(&normalized_path, 1.0);
-
                 return Ok(Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
                     .body(custom_503_body.into())
@@ -483,21 +468,6 @@ where
                 if let Some(pos) = position {
                     queue.remove(pos);
                 }
-
-                // get the average and then minus 10% to avoid forever lockups
-
-                let average_path_latency = path_latencies
-                    .read()
-                    .await
-                    .get_path_average_latency(&normalized_path);
-
-                let average_path_latency_minus_10_percent =
-                    average_path_latency - (average_path_latency * 0.1);
-
-                path_latencies
-                    .write()
-                    .await
-                    .update_path_latency(&normalized_path, average_path_latency_minus_10_percent);
 
                 return Ok(Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
