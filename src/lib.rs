@@ -442,10 +442,20 @@ where
                 let mut queue = queue_arc.write().await;
                 let position = queue.iter().position(|r| r.uuid == uuid);
 
-                println!("EXPECTED TIME TOO HIGH, RETURNING 503");
+                println!(
+                    "EXPECTED TIME TOO HIGH, RETURNING 503 AND REMOVING FROM QUEUE - PRE SEMAPHORE"
+                );
 
                 if let Some(pos) = position {
                     queue.remove(pos);
+                }
+
+                // RE-CALCULATE EXPECTED TIME UNTIL PROCESSED WITHOUT THIS REQUEST OR ELSE IT'LL KEEP REJECTING UNTIL ANOTHER REQUEST COMES IN.
+
+                let mut expected_time_until_processed = 0.0;
+                for request in queue.iter_mut() {
+                    expected_time_until_processed += request.expected_average_latency;
+                    request.expected_time_until_processed = expected_time_until_processed;
                 }
 
                 return Ok(Response::builder()
@@ -462,10 +472,18 @@ where
                 let mut queue = queue_arc.write().await;
                 let position = queue.iter().position(|r| r.uuid == uuid);
 
-                println!("EXPECTED TIME TOO HIGH, RETURNING 503");
+                println!("EXPECTED TIME TOO HIGH, RETURNING 503 AND REMOVING FROM QUEUE -  POST SEMAPHORE");
 
                 if let Some(pos) = position {
                     queue.remove(pos);
+                }
+
+                // RE-CALCULATE EXPECTED TIME UNTIL PROCESSED WITHOUT THIS REQUEST OR ELSE IT'LL KEEP REJECTING UNTIL ANOTHER REQUEST COMES IN.
+
+                let mut expected_time_until_processed = 0.0;
+                for request in queue.iter_mut() {
+                    expected_time_until_processed += request.expected_average_latency;
+                    request.expected_time_until_processed = expected_time_until_processed;
                 }
 
                 return Ok(Response::builder()
@@ -933,7 +951,7 @@ mod tests {
                     initialization_latency_ms: 200.0,
                 },
             ],
-            2,
+            20,
             1700.0,
         );
 
