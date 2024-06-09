@@ -1,6 +1,6 @@
 # Pathfinder Load Shedder
 
-### === This is a currently in an experimental stage. Buyer-beware! ===
+### === This is a currently in an experimental stage. Buyer-beware! Right now it relies on Axum, should be generalized to just use Tower. ===
 
 ## Overview
 
