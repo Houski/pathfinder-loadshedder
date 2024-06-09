@@ -436,15 +436,11 @@ where
                 }
             };
 
-            // THIS LOGIC EXISTS TWICE, ONCE BEFORE THE SEMAPHORE IS ACQUIRED, AND ONCE AFTER. THIS ALLOWS INSTANT 503.
-
             if this_request.expected_time_until_processed > max_expected_time_until_processed {
                 let mut queue = queue_arc.write().await;
                 let position = queue.iter().position(|r| r.uuid == uuid);
 
-                println!(
-                    "EXPECTED TIME TOO HIGH, RETURNING 503 AND REMOVING FROM QUEUE - PRE SEMAPHORE"
-                );
+                println!("EXPECTED TIME TO PROCESS REQUEST IS TOO HIGH, RETURNING 503 AND REMOVING FROM QUEUE");
 
                 if let Some(pos) = position {
                     queue.remove(pos);
@@ -464,33 +460,31 @@ where
                     .unwrap());
             }
 
-            let _ = semaphore.acquire().await.unwrap();
+            let permit = semaphore.try_acquire();
 
-            // THIS LOGIC EXISTS TWICE, ONCE BEFORE THE SEMAPHORE IS ACQUIRED, AND ONCE AFTER. THIS ALLOWS FOR 503'ING IF CONDITIONS HAVE CHANGED WHILE WAITING FOR SEMAPHORE.
+            let _ = match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    println!("NO SEMAPHORE (CONCURRENCY) PERMITS AVAILABLE, RETURNING 503 AND REMOVING FROM QUEUE");
+                    let mut queue = queue_arc.write().await;
+                    let position = queue.iter().position(|r| r.uuid == uuid);
 
-            if this_request.expected_time_until_processed > max_expected_time_until_processed {
-                let mut queue = queue_arc.write().await;
-                let position = queue.iter().position(|r| r.uuid == uuid);
+                    if let Some(pos) = position {
+                        queue.remove(pos);
+                    }
 
-                println!("EXPECTED TIME TOO HIGH, RETURNING 503 AND REMOVING FROM QUEUE -  POST SEMAPHORE");
+                    let mut expected_time_until_processed = 0.0;
+                    for request in queue.iter_mut() {
+                        expected_time_until_processed += request.expected_average_latency;
+                        request.expected_time_until_processed = expected_time_until_processed;
+                    }
 
-                if let Some(pos) = position {
-                    queue.remove(pos);
+                    return Ok(Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(custom_503_body.into())
+                        .unwrap());
                 }
-
-                // RE-CALCULATE EXPECTED TIME UNTIL PROCESSED WITHOUT THIS REQUEST OR ELSE IT'LL KEEP REJECTING UNTIL ANOTHER REQUEST COMES IN.
-
-                let mut expected_time_until_processed = 0.0;
-                for request in queue.iter_mut() {
-                    expected_time_until_processed += request.expected_average_latency;
-                    request.expected_time_until_processed = expected_time_until_processed;
-                }
-
-                return Ok(Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .body(custom_503_body.into())
-                    .unwrap());
-            }
+            };
 
             let new_req = Request::from_parts(
                 this_request.parts.clone(),
@@ -534,7 +528,7 @@ where
                         "Pathfinder load shedder error in response occured: {:?}",
                         err.into()
                     );
-                    // return internal server error
+
                     return Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .body("Internal server error".into())
@@ -542,6 +536,7 @@ where
                 }
                 Err(err) => {
                     println!("GATEWAY_TIMEOUT: {:?}", err);
+
                     return Ok(Response::builder()
                         .status(StatusCode::GATEWAY_TIMEOUT)
                         .body("Request timed out".into())
