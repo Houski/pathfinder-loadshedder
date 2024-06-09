@@ -154,9 +154,9 @@ where
                     drop(permit);
                     res
                 }
-                Err(_) => {
+                Err(err) => {
                     drop(permit);
-                    println!("PATHFINDER LOAD SHEDDER - Request timed out");
+                    println!("PATHFINDER LOAD SHEDDER - Request timed out: {:?}", err);
                     Ok(Response::builder()
                         .status(StatusCode::GATEWAY_TIMEOUT)
                         .body(Body::empty())
