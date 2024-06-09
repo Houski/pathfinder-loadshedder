@@ -5,11 +5,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::{
-    collections::HashMap,
     sync::Arc,
     task::{Context, Poll},
 };
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
+use tokio::time::Duration;
 use tower::{Layer, Service};
 
 lazy_static! {
@@ -73,6 +74,7 @@ pub struct PathfinderLoadShedder<S> {
     semaphore: Arc<Semaphore>,
     pathfinder_path_transforms: PathfinderPathTransforms,
     inner: S,
+    timeout_ms: u64,
 }
 
 impl<S> PathfinderLoadShedder<S> {
@@ -80,11 +82,13 @@ impl<S> PathfinderLoadShedder<S> {
         pathfinder_path_transforms: PathfinderPathTransforms,
         inner: S,
         max_concurrent_requests: usize,
+        timeout_ms: u64,
     ) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
             pathfinder_path_transforms,
             inner,
+            timeout_ms,
         }
     }
 }
@@ -117,6 +121,7 @@ where
 
         let semaphore = self.semaphore.clone();
         let custom_503_body: &str = &PATHFINDER_503_BODY.lock().expect("503 body not set");
+        let timeout_ms = self.timeout_ms;
 
         println!("PATHFINDER LOAD SHEDDER - Path: {}", path);
 
@@ -144,7 +149,16 @@ where
                 semaphore.available_permits()
             );
 
-            let response = inner.call(req).await;
+            let response = match timeout(Duration::from_millis(timeout_ms), inner.call(req)).await {
+                Ok(res) => res,
+                Err(_) => {
+                    println!("PATHFINDER LOAD SHEDDER - Request timed out");
+                    Ok(Response::builder()
+                        .status(StatusCode::GATEWAY_TIMEOUT)
+                        .body(Body::empty())
+                        .unwrap())
+                }
+            };
 
             drop(permit);
 
@@ -162,16 +176,19 @@ where
 pub struct PathfinderLoadShedderLayer {
     pathfinder_path_transforms: PathfinderPathTransforms,
     max_concurrent_requests: usize,
+    timeout_ms: u64,
 }
 
 impl PathfinderLoadShedderLayer {
     pub fn new(
         pathfinder_path_transforms: Vec<PathfinderPath>,
         max_concurrent_requests: usize,
+        timeout_ms: u64,
     ) -> Self {
         Self {
             pathfinder_path_transforms: PathfinderPathTransforms::new(pathfinder_path_transforms),
             max_concurrent_requests,
+            timeout_ms,
         }
     }
     pub fn set_pathfinder_503_body(&self, body: &'static str) -> Self {
@@ -188,6 +205,7 @@ impl<S> Layer<S> for PathfinderLoadShedderLayer {
             self.pathfinder_path_transforms.clone(),
             inner,
             self.max_concurrent_requests,
+            self.timeout_ms,
         )
     }
 }
@@ -270,7 +288,8 @@ mod tests {
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer = PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test/*" }], 1);
+        let layer =
+            PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test/*" }], 1, 100000);
 
         let mut load_shedder = layer.layer(service);
 
@@ -290,7 +309,8 @@ mod tests {
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer = PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 2);
+        let layer =
+            PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 2, 100000);
 
         let mut load_shedder = layer.layer(service);
 
@@ -332,7 +352,8 @@ mod tests {
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer = PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 1);
+        let layer =
+            PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 1, 100000);
         let layer = layer.set_pathfinder_503_body("Custom 503 Body");
 
         let mut load_shedder = layer.layer(service);
@@ -359,5 +380,26 @@ mod tests {
         let body_bytes = to_bytes(response2.into_body(), 1000000).await.unwrap();
         let body_str = std::str::from_utf8(&body_bytes).unwrap();
         assert_eq!(body_str, "Custom 503 Body");
+    }
+
+    #[tokio::test]
+    async fn test_load_shedding_timeout_handling() {
+        let service = service_fn(|_req: Request<Body>| async {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
+        });
+
+        let layer = PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 2, 100);
+
+        let mut load_shedder = layer.layer(service);
+
+        let request = Request::builder()
+            .uri("/test/path")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = load_shedder.call(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 }

@@ -10,6 +10,7 @@ Pathfinder Load Shedder is a middleware service built using the `tower` library 
 
 - **Global Request Limiting**: Define paths to be globally monitored and limit concurrent requests across these paths.
 - **Customizable 503 Responses**: Configure custom response bodies for 503 status.
+- **Timeouts**: A timeout can be set specifically for the requests affected by this middleware.
 
 ## Example
 
@@ -30,8 +31,8 @@ async fn main() {
         PathfinderPath { path: "/api/v1/other" },
     ];
 
-    // Create PathfinderLoadShedderLayer with a global max of 2 concurrent requests
-    let load_shedder_layer = PathfinderLoadShedderLayer::new(paths, 2)
+    // Create PathfinderLoadShedderLayer with a global max of 2 concurrent requests with a 10 second timeout.
+    let load_shedder_layer = PathfinderLoadShedderLayer::new(paths, 2, 10000)
         .set_pathfinder_503_body("Service Temporarily Unavailable");
 
     // Build our application with some routes
