@@ -1,34 +1,53 @@
-# Pathfinder Loadshedder
+# Pathfinder Load Shedder
 
-This is a URL path-based load-shedding solution for Axum.
+### === This is a currently in an experimental stage. Buyer-beware! ===
 
-It calculates the average load times for various URL paths on your website, prioritizing the fastest loading pages to be served first. This approach allows your website to handle more traffic by serving slow loading pages only if the server can manage the load.
+## Overview
 
-We developed this solution because our site, houski.ca, which has over 9 million pages, frequently experiences heavy spidering that can max out our server's usage.
+Pathfinder Load Shedder is a middleware service built using the `tower` library in Rust. It is designed to manage and limit the number of concurrent requests globally, particularly targeting your heaviest paths to shed excess load by returning a 503 Service Unavailable status with a customizable body.
 
-Pathfinder Loadshedder helps keep our site up, fast for most requests, and running smoothly even under heavy traffic.
+## Features
 
-If a user requests a slow loading page when the server is maxed out, they will be informed immediately that the page is temporarily unavailable, and they can try again later.
+- **Global Request Limiting**: Define paths to be globally monitored and limit concurrent requests across these paths.
+- **Customizable 503 Responses**: Configure custom response bodies for 503 status.
 
-Requests that exceed the timeout threshold will not be queued, preventing the server from becoming overloaded by avoiding a backlog of pending requests.
+## Example
 
-Inspired by the little-loadshedder project that didn't do quite what we needed.
+A basic example of how to integrate Pathfinder Load Shedder into an Axum application.
 
-## License
+```rust
 
-Licensed under either of
+use axum::{Router, routing::get, response::IntoResponse};
+use tower::ServiceBuilder;
+use std::sync::Arc;
 
-- Apache License, Version 2.0
-  ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license
-  ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+#[tokio::main]
+async fn main() {
+    // Define paths to globally limit.
+    // Any requests to paths not in this list are simply passed through, unaffected.
+    let paths = vec![
+        PathfinderPath { path: "/api/v1/resource" },
+        PathfinderPath { path: "/api/v1/other" },
+    ];
 
-at your option.
+    // Create PathfinderLoadShedderLayer with a global max of 2 concurrent requests
+    let load_shedder_layer = PathfinderLoadShedderLayer::new(paths, 2)
+        .set_pathfinder_503_body("Service Temporarily Unavailable");
 
-## Contribution
+    // Build our application with some routes
+    let app = Router::new()
+        .route("/api/v1/resource", get(handler))
+        .route("/api/v1/other", get(handler))
+        .layer(ServiceBuilder::new().layer(load_shedder_layer));
 
-This project welcomes contributions and suggestions, just open an issue or pull request!
+    // Run our application
+    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+}
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
-dual licensed as above, without any additional terms or conditions.
+async fn handler() -> impl IntoResponse {
+    "Hello, world!"
+}
+```
