@@ -150,8 +150,12 @@ where
             );
 
             let response = match timeout(Duration::from_millis(timeout_ms), inner.call(req)).await {
-                Ok(res) => res,
+                Ok(res) => {
+                    drop(permit);
+                    res
+                }
                 Err(_) => {
+                    drop(permit);
                     println!("PATHFINDER LOAD SHEDDER - Request timed out");
                     Ok(Response::builder()
                         .status(StatusCode::GATEWAY_TIMEOUT)
@@ -159,8 +163,6 @@ where
                         .unwrap())
                 }
             };
-
-            drop(permit);
 
             println!(
                 "PATHFINDER LOAD SHEDDER - Semaphores available post-release: {}",
