@@ -378,6 +378,8 @@ where
 
             // Initial request comes in, and basically only affects the queue
 
+            // MAYBE WE CAN MAKE IT SO ONLY THINGS THAT ACTUALLY ARE GOING TO BE PROCESSED ENTER THE QUEUE ?
+
             {
                 let mut queue = queue_arc.write().await;
                 if queue.len() >= 1000 {
@@ -398,7 +400,7 @@ where
                     body: body_bytes.clone(),
                     parts: parts.clone(),
                     expected_average_latency: expected_path_latency,
-                    expected_time_until_processed: expected_path_latency, // this is the default initial value
+                    expected_time_until_processed: expected_path_latency,
                 });
 
                 println!("Queue length: {}", queue.len());
@@ -412,23 +414,18 @@ where
                         request.uuid, expected_time_until_processed,
                     );
                 }
-
-                // I think we should also just drop requests right here as well if the expected time is too high, as well as AFTER the semaphore.
             }
 
-            // then when we have the semaphore, we can acquire it and then process the actual request
-
-            let mut this_request: Option<QueuedRequest> = None;
-
-            {
-                let queue = queue_arc.write().await;
-
-                this_request = queue.iter().find(|r| r.uuid == uuid).cloned();
-            }
+            let queue = queue_arc.write().await;
+            let this_request: Option<QueuedRequest> =
+                queue.iter().find(|r| r.uuid == uuid).cloned();
 
             let this_request = match this_request {
                 Some(r) => r,
                 None => {
+                    let mut queue = queue_arc.write().await;
+                    queue.retain(|r| r.uuid != uuid);
+
                     return Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .body("Request not found".into())
@@ -437,28 +434,17 @@ where
             };
 
             if this_request.expected_time_until_processed > max_expected_time_until_processed {
-                let mut queue = queue_arc.write().await;
-                let position = queue.iter().position(|r| r.uuid == uuid);
-
                 println!("EXPECTED TIME TO PROCESS REQUEST IS TOO HIGH, RETURNING 503 AND REMOVING FROM QUEUE");
-
-                if let Some(pos) = position {
-                    queue.remove(pos);
-                }
-
-                // RE-CALCULATE EXPECTED TIME UNTIL PROCESSED WITHOUT THIS REQUEST OR ELSE IT'LL KEEP REJECTING UNTIL ANOTHER REQUEST COMES IN.
-
-                let mut expected_time_until_processed = 0.0;
-                for request in queue.iter_mut() {
-                    expected_time_until_processed += request.expected_average_latency;
-                    request.expected_time_until_processed = expected_time_until_processed;
-                }
+                let mut queue = queue_arc.write().await;
+                queue.retain(|r| r.uuid != uuid);
 
                 return Ok(Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
                     .body(custom_503_body.into())
                     .unwrap());
             }
+
+            // then if we have an available semaphore, we can process the actual request
 
             let permit = semaphore.try_acquire();
 
@@ -467,17 +453,7 @@ where
                 Err(_) => {
                     println!("NO SEMAPHORE (CONCURRENCY) PERMITS AVAILABLE, RETURNING 503 AND REMOVING FROM QUEUE");
                     let mut queue = queue_arc.write().await;
-                    let position = queue.iter().position(|r| r.uuid == uuid);
-
-                    if let Some(pos) = position {
-                        queue.remove(pos);
-                    }
-
-                    let mut expected_time_until_processed = 0.0;
-                    for request in queue.iter_mut() {
-                        expected_time_until_processed += request.expected_average_latency;
-                        request.expected_time_until_processed = expected_time_until_processed;
-                    }
+                    queue.retain(|r| r.uuid != uuid);
 
                     return Ok(Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -501,13 +477,7 @@ where
 
             let end_time = start_time.elapsed().as_millis() as f32;
 
-            let position = queue.iter().position(|r| r.uuid == uuid);
-
-            println!("Position: {:?}", position);
-
-            if let Some(pos) = position {
-                queue.remove(pos);
-            }
+            queue.retain(|r| r.uuid != uuid);
 
             match res {
                 Ok(Ok(response)) => {
