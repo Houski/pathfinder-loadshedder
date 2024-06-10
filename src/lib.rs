@@ -74,7 +74,6 @@ pub struct PathfinderLoadShedder<S> {
     semaphore: Arc<Semaphore>,
     pathfinder_path_transforms: PathfinderPathTransforms,
     inner: S,
-    timeout_ms: u64,
 }
 
 impl<S> PathfinderLoadShedder<S> {
@@ -82,13 +81,11 @@ impl<S> PathfinderLoadShedder<S> {
         pathfinder_path_transforms: PathfinderPathTransforms,
         inner: S,
         max_concurrent_requests: usize,
-        timeout_ms: u64,
     ) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
             pathfinder_path_transforms,
             inner,
-            timeout_ms,
         }
     }
 }
@@ -121,7 +118,6 @@ where
 
         let semaphore = self.semaphore.clone();
         let custom_503_body: &str = &PATHFINDER_503_BODY.lock().expect("503 body not set");
-        let timeout_ms = self.timeout_ms;
 
         println!("PATHFINDER LOAD SHEDDER - Path: {}", path);
 
@@ -149,20 +145,9 @@ where
                 semaphore.available_permits()
             );
 
-            let response = match timeout(Duration::from_millis(timeout_ms), inner.call(req)).await {
-                Ok(res) => {
-                    drop(permit);
-                    res
-                }
-                Err(err) => {
-                    drop(permit);
-                    println!("PATHFINDER LOAD SHEDDER - Request timed out: {:?}", err);
-                    return Ok(Response::builder()
-                        .status(StatusCode::GATEWAY_TIMEOUT)
-                        .body(Body::empty())
-                        .unwrap());
-                }
-            };
+            let response = inner.call(req).await;
+
+            drop(permit);
 
             println!(
                 "PATHFINDER LOAD SHEDDER - Semaphores available post-release: {}",
@@ -178,19 +163,16 @@ where
 pub struct PathfinderLoadShedderLayer {
     pathfinder_path_transforms: PathfinderPathTransforms,
     max_concurrent_requests: usize,
-    timeout_ms: u64,
 }
 
 impl PathfinderLoadShedderLayer {
     pub fn new(
         pathfinder_path_transforms: Vec<PathfinderPath>,
         max_concurrent_requests: usize,
-        timeout_ms: u64,
     ) -> Self {
         Self {
             pathfinder_path_transforms: PathfinderPathTransforms::new(pathfinder_path_transforms),
             max_concurrent_requests,
-            timeout_ms,
         }
     }
     pub fn set_pathfinder_503_body(&self, body: &'static str) -> Self {
@@ -207,7 +189,6 @@ impl<S> Layer<S> for PathfinderLoadShedderLayer {
             self.pathfinder_path_transforms.clone(),
             inner,
             self.max_concurrent_requests,
-            self.timeout_ms,
         )
     }
 }
@@ -290,8 +271,7 @@ mod tests {
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer =
-            PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test/*" }], 1, 100000);
+        let layer = PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test/*" }], 1);
 
         let mut load_shedder = layer.layer(service);
 
@@ -311,8 +291,7 @@ mod tests {
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer =
-            PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 2, 100000);
+        let layer = PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 2);
 
         let mut load_shedder = layer.layer(service);
 
@@ -354,8 +333,7 @@ mod tests {
             Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
         });
 
-        let layer =
-            PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 1, 100000);
+        let layer = PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 1);
         let layer = layer.set_pathfinder_503_body("Custom 503 Body");
 
         let mut load_shedder = layer.layer(service);
@@ -384,27 +362,6 @@ mod tests {
         assert_eq!(body_str, "Custom 503 Body");
     }
 
-    #[tokio::test]
-    async fn test_load_shedding_timeout_handling() {
-        let service = service_fn(|_req: Request<Body>| async {
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
-        });
-
-        let layer = PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 2, 100);
-
-        let mut load_shedder = layer.layer(service);
-
-        let request = Request::builder()
-            .uri("/test/path")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = load_shedder.call(request).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-    }
-
     #[cfg(test)]
     mod additional_tests {
         use super::*;
@@ -418,8 +375,7 @@ mod tests {
                 Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
             });
 
-            let layer =
-                PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 1, 100000);
+            let layer = PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 1);
 
             let mut load_shedder = layer.layer(service);
 
@@ -445,8 +401,7 @@ mod tests {
                 Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
             });
 
-            let layer =
-                PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 1, 100000);
+            let layer = PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 1);
 
             let mut load_shedder = layer.layer(service);
 
@@ -464,49 +419,13 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_load_shedding_multiple_timeout_recovery() {
-            let service = service_fn(|_req: Request<Body>| async {
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
-            });
-
-            let layer =
-                PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 2, 100);
-
-            let mut load_shedder = layer.layer(service);
-
-            // First request should timeout
-            let request1 = Request::builder()
-                .uri("/test/path")
-                .body(Body::empty())
-                .unwrap();
-
-            let response1 = load_shedder.call(request1).await.unwrap();
-            assert_eq!(response1.status(), StatusCode::GATEWAY_TIMEOUT);
-
-            // Second request should also timeout
-            let request2 = Request::builder()
-                .uri("/test/path")
-                .body(Body::empty())
-                .unwrap();
-
-            let response2 = load_shedder.call(request2).await.unwrap();
-            assert_eq!(response2.status(), StatusCode::GATEWAY_TIMEOUT);
-
-            // After timeouts, semaphore permits should be available
-            let semaphore_available_permits = load_shedder.semaphore.available_permits();
-            assert_eq!(semaphore_available_permits, 2);
-        }
-
-        #[tokio::test]
         async fn test_load_shedding_multiple_requests_same_path() {
             let service = service_fn(|_req: Request<Body>| async {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
             });
 
-            let layer =
-                PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 1, 100000);
+            let layer = PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 1);
 
             let mut load_shedder = layer.layer(service);
 
@@ -544,8 +463,7 @@ mod tests {
                 Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
             });
 
-            let layer =
-                PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 1, 100000);
+            let layer = PathfinderLoadShedderLayer::new(vec![PathfinderPath { path: "/test" }], 1);
 
             let mut load_shedder = layer.layer(service);
 
@@ -576,53 +494,8 @@ mod tests {
             assert_eq!(response3.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
 
-        #[tokio::test]
-        async fn test_load_shedding_custom_503_body_after_recovery() {
-            let service = service_fn(|req: Request<Body>| {
-                let path = req.uri().path().to_string();
-                async move {
-                    if path == "/test/path" {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                    } else {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    }
-                    Ok::<_, hyper::Error>(Response::new(Body::from("Hello, World!")))
-                }
-            });
-
-            let layer = PathfinderLoadShedderLayer::new(
-                vec![
-                    PathfinderPath { path: "/test" },
-                    PathfinderPath { path: "/test2" },
-                ],
-                1,
-                100,
-            )
-            .set_pathfinder_503_body("Custom 503 Body");
-
-            let mut load_shedder = layer.layer(service);
-
-            // First request should timeout and cause a 503
-            let request1 = Request::builder()
-                .uri("/test/path")
-                .body(Body::empty())
-                .unwrap();
-
-            let response1 = load_shedder.call(request1).await.unwrap();
-            assert_eq!(response1.status(), StatusCode::GATEWAY_TIMEOUT);
-
-            // Second request should recover
-            let request2 = Request::builder()
-                .uri("/test2/path")
-                .body(Body::empty())
-                .unwrap();
-
-            let response2 = load_shedder.call(request2).await.unwrap();
-            assert_eq!(response2.status(), StatusCode::OK);
-        }
-
-        #[tokio::test]
-        async fn test_load_shedding_with_real_world_conditions() {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
+        async fn test_load_shedding_with_real_world_conditions_pinned_cpu() {
             use axum::{routing::get, Router};
             use rand::Rng;
             use reqwest::Client;
@@ -631,6 +504,14 @@ mod tests {
             use tokio::task::JoinHandle;
             use tokio::time::{sleep, Duration};
 
+            fn cpu_intensive_task(max_num: u64) -> u64 {
+                let mut sum = 0;
+                for i in 0..max_num {
+                    sum += i;
+                }
+                sum
+            }
+
             // Define the PathfinderLoadShedderLayer with paths, max concurrent requests, and timeout
             let layer = PathfinderLoadShedderLayer::new(
                 vec![
@@ -638,7 +519,6 @@ mod tests {
                     PathfinderPath { path: "/random" },
                 ],
                 2,
-                800,
             );
 
             // Set up the Axum app with routes and the load shedding layer
@@ -646,27 +526,36 @@ mod tests {
                 .route(
                     "/test/path1",
                     get(|| async {
-                        let duration =
-                            Duration::from_millis(rand::thread_rng().gen_range(500..1000));
-                        sleep(duration).await;
+                        let start_timer = std::time::Instant::now();
+                        cpu_intensive_task(180_000_000);
+                        println!(
+                            "CPU Intensive Task for /test/path1 took: {:?}",
+                            start_timer.elapsed().as_secs_f64()
+                        );
                         "Done with /test/path1"
                     }),
                 )
                 .route(
                     "/test/path2",
                     get(|| async {
-                        let duration =
-                            Duration::from_millis(rand::thread_rng().gen_range(200..500));
-                        sleep(duration).await;
+                        let start_timer = std::time::Instant::now();
+                        cpu_intensive_task(121_000_000);
+                        println!(
+                            "CPU Intensive Task for /test/path2 took: {:?}",
+                            start_timer.elapsed().as_secs_f64()
+                        );
                         "Done with /test/path2"
                     }),
                 )
                 .route(
                     "/random/path1",
                     get(|| async {
-                        let duration =
-                            Duration::from_millis(rand::thread_rng().gen_range(300..700));
-                        sleep(duration).await;
+                        let start_timer = std::time::Instant::now();
+                        cpu_intensive_task(150_000_000);
+                        println!(
+                            "CPU Intensive Task for /random/path1 took: {:?}",
+                            start_timer.elapsed().as_secs_f64()
+                        );
                         "Done with /random/path1"
                     }),
                 )
@@ -694,7 +583,7 @@ mod tests {
 
             let results = Arc::new(Mutex::new(Vec::new()));
 
-            let request_number = 250;
+            let request_number = 100;
 
             for _ in 0..request_number {
                 let client_clone = client.clone();
@@ -727,8 +616,6 @@ mod tests {
                                 "OK"
                             } else if response.status() == StatusCode::SERVICE_UNAVAILABLE {
                                 "SERVICE_UNAVAILABLE"
-                            } else if response.status() == StatusCode::GATEWAY_TIMEOUT {
-                                "GATEWAY_TIMEOUT"
                             } else {
                                 "ERROR"
                             }
@@ -747,10 +634,7 @@ mod tests {
 
             println!("Unique Response types: {:?}", response_types);
 
-            assert_eq!(
-                response_types,
-                vec!["GATEWAY_TIMEOUT", "OK", "SERVICE_UNAVAILABLE"]
-            );
+            assert_eq!(response_types, vec!["OK", "SERVICE_UNAVAILABLE"]);
 
             // Shutdown the server
             server_handle.abort();

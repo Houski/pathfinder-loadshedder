@@ -12,7 +12,7 @@ categories = ["network-programming"]
 axum = { version = "0.7.5" }
 hyper = "1.2"
 lazy_static = "1.4.0"
-tokio = { version = "1" }
+tokio = { version = "1", features=["rt-multi-thread"] }
 tower = { version = "0.4" }
 
 [dev-dependencies]
